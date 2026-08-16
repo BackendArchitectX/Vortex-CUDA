@@ -65,3 +65,7 @@ benchmark_results_full/
 
 # Generated Java build output
 java/build/
+
+# Maven build output
+java/target/
+server/target/

@@ -62,3 +62,6 @@ Thumbs.db
 # Generated benchmark artifacts
 benchmark_results/
 benchmark_results_full/
+
+# Generated Java build output
+java/build/

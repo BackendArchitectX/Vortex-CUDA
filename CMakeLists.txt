@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
         VortexCUDA
-        VERSION 0.2.0
+        VERSION 0.3.0
         LANGUAGES CXX CUDA
 )
 
@@ -51,7 +51,7 @@ if (GIT_FOUND)
 endif()
 
 # ---------------------------------------------------------
-# Main Vortex executable
+# Existing native executable
 # ---------------------------------------------------------
 
 add_executable(
@@ -98,3 +98,42 @@ target_compile_definitions(
         VORTEX_GIT_COMMIT="${VORTEX_GIT_COMMIT}"
         VORTEX_GIT_DIRTY=${VORTEX_GIT_DIRTY}
 )
+
+# ---------------------------------------------------------
+# Milestone 16 JNI shared library
+#
+# Java -> JNI -> GpuVectorIndex -> CUDA
+# ---------------------------------------------------------
+
+find_package(JNI REQUIRED)
+
+add_library(
+        vortex_jni
+        SHARED
+        src/vortex_jni.cpp
+        src/gpu_vector_index.cu
+)
+
+target_include_directories(
+        vortex_jni
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${JNI_INCLUDE_DIRS}
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+)
+
+set_target_properties(
+        vortex_jni
+        PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RUNTIME_LIBRARY Static
+        OUTPUT_NAME "vortex_jni"
+)
+
+if (MSVC)
+    target_compile_options(
+            vortex_jni
+            PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/W4>
+    )
+endif()

@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <vector>
 
@@ -81,7 +82,7 @@ struct GpuBatchTopKResult
     int topK = 0;
 
     // 1 for the Milestone 7 path.
-    // 1/2/4 for the adaptive Milestone 8/M10 paths.
+    // 1/2/4 for the adaptive Milestone 8/M10/M11 paths.
     int queryTileSize = 1;
 
     // True when the Milestone 10 float4 path was used.
@@ -97,6 +98,19 @@ struct GpuBatchTopKResult
     double totalTimeMs = 0.0;
 
     int topKPasses = 0;
+};
+
+
+struct GpuQueryTileTuningResult
+{
+    int selectedTileSize = 1;
+    int iterations = 0;
+
+    // Median first-stage kernel latency for each candidate.
+    // A negative value means the candidate was not eligible.
+    float tile1MedianKernelTimeMs = -1.0F;
+    float tile2MedianKernelTimeMs = -1.0F;
+    float tile4MedianKernelTimeMs = -1.0F;
 };
 
 class GpuVectorIndex
@@ -213,6 +227,36 @@ public:
         int topK
     );
 
+
+    // -----------------------------------------------------
+    // Milestone 11 vectorized query-tile autotuning
+    //
+    // Candidate tiles are 1, 2 and 4, constrained by the
+    // current batch size. Calibration is performed outside
+    // steady-state timing and cached by (queryCount, topK).
+    // -----------------------------------------------------
+
+    [[nodiscard]]
+    GpuQueryTileTuningResult autotuneVectorizedQueryTileSize(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK,
+        int iterations = 7
+    );
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiledVectorizedAuto(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK
+    );
+
+    [[nodiscard]]
+    int tunedVectorizedQueryTileSize(
+        int queryCount,
+        int topK
+    ) const noexcept;
+
     void warmUp(
         const GpuSearchConfig& config,
         int iterations = 1
@@ -242,6 +286,12 @@ public:
     );
 
     void warmUpTopKBatchTiledVectorized(
+        int queryCount,
+        int topK,
+        int iterations = 1
+    );
+
+    void warmUpTopKBatchTiledVectorizedAuto(
         int queryCount,
         int topK,
         int iterations = 1
@@ -284,6 +334,32 @@ public:
     }
 
 private:
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiledVectorizedWithTile(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK,
+        int queryTileSize
+    );
+
+    [[nodiscard]]
+    static constexpr std::size_t tuningCacheIndex(
+        const int queryCount,
+        const int topK) noexcept
+    {
+        return
+            static_cast<std::size_t>(
+                queryCount
+            ) *
+            static_cast<std::size_t>(
+                MAX_TOP_K + 1
+            ) +
+            static_cast<std::size_t>(
+                topK
+            );
+    }
+
     int vectorCount_;
     int dimension_;
 
@@ -296,8 +372,8 @@ private:
     DeviceBuffer<Neighbor> deviceTopKBufferA_;
     DeviceBuffer<Neighbor> deviceTopKBufferB_;
 
-    // Persistent batch storage shared by the M7, M8 and
-    // M10 paths. The methods execute synchronously, so the same
+    // Persistent batch storage shared by the M7, M8, M10
+    // and M11 paths. The methods execute synchronously, so the same
     // ping-pong buffers can be reused safely.
     DeviceBuffer<float> deviceBatchQueries_;
 
@@ -306,6 +382,18 @@ private:
 
     DeviceBuffer<Neighbor>
         deviceBatchTopKBufferB_;
+
+
+    // 0 means "not tuned yet". Valid cached tiles are 1/2/4.
+    std::array<
+        int,
+        static_cast<std::size_t>(
+            MAX_BATCH_SIZE + 1
+        ) *
+        static_cast<std::size_t>(
+            MAX_TOP_K + 1
+        )
+    > tunedVectorizedTileSizes_{};
 
     cudaEvent_t distanceStart_{};
     cudaEvent_t distanceStop_{};

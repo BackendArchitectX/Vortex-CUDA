@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cstddef>
@@ -2163,6 +2164,46 @@ void launchConfiguredKernel(
 }
 
 
+
+float medianKernelTime(
+    std::vector<float> values)
+{
+    if (values.empty())
+    {
+        throw std::invalid_argument(
+            "Cannot calculate a median from empty data."
+        );
+    }
+
+    std::sort(
+        values.begin(),
+        values.end()
+    );
+
+    const std::size_t middle =
+        values.size() /
+        2;
+
+    if ((values.size() & 1U) != 0U)
+    {
+        return
+            values[
+                middle
+            ];
+    }
+
+    return
+        0.5F *
+        (
+            values[
+                middle - 1
+            ] +
+            values[
+                middle
+            ]
+        );
+}
+
 int selectQueryTileSize(
     const int queryCount)
 {
@@ -3843,18 +3884,35 @@ GpuVectorIndex::searchTopKBatchTiled(
 // =========================================================
 
 GpuBatchTopKResult
-GpuVectorIndex::searchTopKBatchTiledVectorized(
+GpuVectorIndex::searchTopKBatchTiledVectorizedWithTile(
     const std::vector<float>& queries,
     const int queryCount,
-    const int topK)
+    const int topK,
+    const int queryTileSize)
 {
     if (queryCount <= 0 ||
         queryCount >
             MAX_BATCH_SIZE)
     {
         throw std::invalid_argument(
-            "queryCount must be between "
-            "1 and 32."
+            "queryCount must be between 1 and 32."
+        );
+    }
+
+    if (queryTileSize != 1 &&
+        queryTileSize != 2 &&
+        queryTileSize != 4)
+    {
+        throw std::invalid_argument(
+            "queryTileSize must be 1, 2 or 4."
+        );
+    }
+
+    if (queryTileSize >
+        queryCount)
+    {
+        throw std::invalid_argument(
+            "queryTileSize cannot exceed queryCount."
         );
     }
 
@@ -3878,8 +3936,7 @@ GpuVectorIndex::searchTopKBatchTiledVectorized(
         expectedElements)
     {
         throw std::invalid_argument(
-            "queries.size() must equal "
-            "queryCount * dimension."
+            "queries.size() must equal queryCount * dimension."
         );
     }
 
@@ -3895,9 +3952,7 @@ GpuVectorIndex::searchTopKBatchTiledVectorized(
         topK;
 
     result.queryTileSize =
-        selectQueryTileSize(
-            queryCount
-        );
+        queryTileSize;
 
     result.vectorizedLoadsUsed =
         (dimension_ % 4) == 0;
@@ -4106,6 +4161,307 @@ GpuVectorIndex::searchTopKBatchTiledVectorized(
         ).count();
 
     return result;
+}
+
+GpuBatchTopKResult
+GpuVectorIndex::searchTopKBatchTiledVectorized(
+    const std::vector<float>& queries,
+    const int queryCount,
+    const int topK)
+{
+    return
+        searchTopKBatchTiledVectorizedWithTile(
+            queries,
+            queryCount,
+            topK,
+            selectQueryTileSize(
+                queryCount
+            )
+        );
+}
+
+// =========================================================
+// Milestone 11 vectorized query-tile autotuning
+// =========================================================
+
+GpuQueryTileTuningResult
+GpuVectorIndex::autotuneVectorizedQueryTileSize(
+    const std::vector<float>& queries,
+    const int queryCount,
+    const int topK,
+    const int iterations)
+{
+    if (iterations <= 0)
+    {
+        throw std::invalid_argument(
+            "Autotune iterations must be positive."
+        );
+    }
+
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between 1 and 32."
+        );
+    }
+
+    validateTopK(
+        topK,
+        vectorCount_
+    );
+
+    const std::size_t expectedElements =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                dimension_
+            ),
+            "Batch query dimensions overflow size_t."
+        );
+
+    if (queries.size() !=
+        expectedElements)
+    {
+        throw std::invalid_argument(
+            "queries.size() must equal queryCount * dimension."
+        );
+    }
+
+    GpuQueryTileTuningResult tuning;
+
+    tuning.iterations =
+        iterations;
+
+    // If float4 is not legal for this dimension, preserve
+    // the validated M8 adaptive policy rather than spending
+    // calibration time on scalar variants.
+    if ((dimension_ % 4) != 0)
+    {
+        tuning.selectedTileSize =
+            selectQueryTileSize(
+                queryCount
+            );
+
+        tunedVectorizedTileSizes_[
+            tuningCacheIndex(
+                queryCount,
+                topK
+            )
+        ] =
+            tuning.selectedTileSize;
+
+        return tuning;
+    }
+
+    const std::array<int, 3>
+        candidates{
+            1,
+            2,
+            4
+        };
+
+    std::array<
+        std::vector<float>,
+        3
+    > timings;
+
+    // One unmeasured warm-up per eligible candidate.
+    for (std::size_t candidateIndex = 0;
+         candidateIndex <
+             candidates.size();
+         ++candidateIndex)
+    {
+        const int tile =
+            candidates[
+                candidateIndex
+            ];
+
+        if (tile >
+            queryCount)
+        {
+            continue;
+        }
+
+        (void)
+            searchTopKBatchTiledVectorizedWithTile(
+                queries,
+                queryCount,
+                topK,
+                tile
+            );
+
+        timings[
+            candidateIndex
+        ].reserve(
+            static_cast<std::size_t>(
+                iterations
+            )
+        );
+    }
+
+    // Rotate candidate order across iterations to reduce
+    // deterministic order/thermal bias during calibration.
+    for (int iteration = 0;
+         iteration < iterations;
+         ++iteration)
+    {
+        for (std::size_t step = 0;
+             step <
+                 candidates.size();
+             ++step)
+        {
+            const std::size_t candidateIndex =
+                (
+                    static_cast<std::size_t>(
+                        iteration
+                    ) +
+                    step
+                ) %
+                candidates.size();
+
+            const int tile =
+                candidates[
+                    candidateIndex
+                ];
+
+            if (tile >
+                queryCount)
+            {
+                continue;
+            }
+
+            const GpuBatchTopKResult result =
+                searchTopKBatchTiledVectorizedWithTile(
+                    queries,
+                    queryCount,
+                    topK,
+                    tile
+                );
+
+            timings[
+                candidateIndex
+            ].push_back(
+                result.fusedKernelTimeMs
+            );
+        }
+    }
+
+    tuning.tile1MedianKernelTimeMs =
+        medianKernelTime(
+            timings[0]
+        );
+
+    if (queryCount >= 2)
+    {
+        tuning.tile2MedianKernelTimeMs =
+            medianKernelTime(
+                timings[1]
+            );
+    }
+
+    if (queryCount >= 4)
+    {
+        tuning.tile4MedianKernelTimeMs =
+            medianKernelTime(
+                timings[2]
+            );
+    }
+
+    float bestTime =
+        tuning.tile1MedianKernelTimeMs;
+
+    tuning.selectedTileSize =
+        1;
+
+    if (queryCount >= 2 &&
+        tuning.tile2MedianKernelTimeMs <
+            bestTime)
+    {
+        bestTime =
+            tuning.tile2MedianKernelTimeMs;
+
+        tuning.selectedTileSize =
+            2;
+    }
+
+    if (queryCount >= 4 &&
+        tuning.tile4MedianKernelTimeMs <
+            bestTime)
+    {
+        tuning.selectedTileSize =
+            4;
+    }
+
+    tunedVectorizedTileSizes_[
+        tuningCacheIndex(
+            queryCount,
+            topK
+        )
+    ] =
+        tuning.selectedTileSize;
+
+    return tuning;
+}
+
+GpuBatchTopKResult
+GpuVectorIndex::searchTopKBatchTiledVectorizedAuto(
+    const std::vector<float>& queries,
+    const int queryCount,
+    const int topK)
+{
+    int selectedTile =
+        tunedVectorizedQueryTileSize(
+            queryCount,
+            topK
+        );
+
+    if (selectedTile == 0)
+    {
+        const GpuQueryTileTuningResult tuning =
+            autotuneVectorizedQueryTileSize(
+                queries,
+                queryCount,
+                topK
+            );
+
+        selectedTile =
+            tuning.selectedTileSize;
+    }
+
+    return
+        searchTopKBatchTiledVectorizedWithTile(
+            queries,
+            queryCount,
+            topK,
+            selectedTile
+        );
+}
+
+int GpuVectorIndex::tunedVectorizedQueryTileSize(
+    const int queryCount,
+    const int topK) const noexcept
+{
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE ||
+        topK <= 0 ||
+        topK >
+            MAX_TOP_K)
+    {
+        return 0;
+    }
+
+    return
+        tunedVectorizedTileSizes_[
+            tuningCacheIndex(
+                queryCount,
+                topK
+            )
+        ];
 }
 
 // =========================================================
@@ -4347,6 +4703,66 @@ void GpuVectorIndex::warmUpTopKBatchTiledVectorized(
          ++iteration)
     {
         (void)searchTopKBatchTiledVectorized(
+            queries,
+            queryCount,
+            topK
+        );
+    }
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+}
+
+
+void GpuVectorIndex::warmUpTopKBatchTiledVectorizedAuto(
+    const int queryCount,
+    const int topK,
+    const int iterations)
+{
+    if (iterations <= 0)
+    {
+        throw std::invalid_argument(
+            "Warm-up iterations must be positive."
+        );
+    }
+
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between 1 and 32."
+        );
+    }
+
+    std::vector<float> queries(
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            dimension_
+        ),
+        0.0F
+    );
+
+    if (tunedVectorizedQueryTileSize(
+            queryCount,
+            topK
+        ) == 0)
+    {
+        (void)autotuneVectorizedQueryTileSize(
+            queries,
+            queryCount,
+            topK
+        );
+    }
+
+    for (int iteration = 0;
+         iteration < iterations;
+         ++iteration)
+    {
+        (void)searchTopKBatchTiledVectorizedAuto(
             queries,
             queryCount,
             topK

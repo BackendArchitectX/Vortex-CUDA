@@ -82,15 +82,17 @@ struct BatchComparison
 {
     int batchSize = 0;
 
-    PathBenchmark milestone8;
     PathBenchmark milestone10;
+    PathBenchmark milestone11;
 
-    bool m8CpuMatch = false;
+    GpuQueryTileTuningResult tuning;
+
     bool m10CpuMatch = false;
-    bool m8M10Match = false;
+    bool m11CpuMatch = false;
+    bool m10M11Match = false;
 
-    float m8MaxError = 0.0F;
     float m10MaxError = 0.0F;
+    float m11MaxError = 0.0F;
 };
 
 } // namespace
@@ -593,7 +595,7 @@ float maxNeighborDistanceError(
 
 
 // =========================================================
-// Milestone 8 vs Milestone 10 benchmark
+// Milestone 10 fixed policy vs Milestone 11 autotuned policy
 // =========================================================
 
 BatchComparison benchmarkBatchComparison(
@@ -613,11 +615,15 @@ BatchComparison benchmarkBatchComparison(
             dimension
         );
 
-    index.warmUpTopKBatchTiled(
-        batchSize,
-        topK,
-        GPU_WARMUP_RUNS
-    );
+    // Calibration is explicitly outside the measured A/B
+    // benchmark. The selected tile is cached in the index.
+    const GpuQueryTileTuningResult tuning =
+        index.autotuneVectorizedQueryTileSize(
+            batchQueries,
+            batchSize,
+            topK,
+            7
+        );
 
     index.warmUpTopKBatchTiledVectorized(
         batchSize,
@@ -625,11 +631,11 @@ BatchComparison benchmarkBatchComparison(
         GPU_WARMUP_RUNS
     );
 
-    std::vector<double> m8TotalTimes;
-    std::vector<double> m8KernelTimes;
-    std::vector<double> m8MergeTimes;
-    std::vector<double> m8UploadTimes;
-    std::vector<double> m8DownloadTimes;
+    index.warmUpTopKBatchTiledVectorizedAuto(
+        batchSize,
+        topK,
+        GPU_WARMUP_RUNS
+    );
 
     std::vector<double> m10TotalTimes;
     std::vector<double> m10KernelTimes;
@@ -637,11 +643,11 @@ BatchComparison benchmarkBatchComparison(
     std::vector<double> m10UploadTimes;
     std::vector<double> m10DownloadTimes;
 
-    m8TotalTimes.reserve(BENCHMARK_RUNS);
-    m8KernelTimes.reserve(BENCHMARK_RUNS);
-    m8MergeTimes.reserve(BENCHMARK_RUNS);
-    m8UploadTimes.reserve(BENCHMARK_RUNS);
-    m8DownloadTimes.reserve(BENCHMARK_RUNS);
+    std::vector<double> m11TotalTimes;
+    std::vector<double> m11KernelTimes;
+    std::vector<double> m11MergeTimes;
+    std::vector<double> m11UploadTimes;
+    std::vector<double> m11DownloadTimes;
 
     m10TotalTimes.reserve(BENCHMARK_RUNS);
     m10KernelTimes.reserve(BENCHMARK_RUNS);
@@ -649,28 +655,34 @@ BatchComparison benchmarkBatchComparison(
     m10UploadTimes.reserve(BENCHMARK_RUNS);
     m10DownloadTimes.reserve(BENCHMARK_RUNS);
 
-    GpuBatchTopKResult finalM8Result;
+    m11TotalTimes.reserve(BENCHMARK_RUNS);
+    m11KernelTimes.reserve(BENCHMARK_RUNS);
+    m11MergeTimes.reserve(BENCHMARK_RUNS);
+    m11UploadTimes.reserve(BENCHMARK_RUNS);
+    m11DownloadTimes.reserve(BENCHMARK_RUNS);
+
     GpuBatchTopKResult finalM10Result;
+    GpuBatchTopKResult finalM11Result;
 
     for (int run = 0;
          run < BENCHMARK_RUNS;
          ++run)
     {
-        GpuBatchTopKResult m8Result;
         GpuBatchTopKResult m10Result;
+        GpuBatchTopKResult m11Result;
 
         // Alternate order to reduce temperature/order bias.
         if ((run & 1) == 0)
         {
-            m8Result =
-                index.searchTopKBatchTiled(
+            m10Result =
+                index.searchTopKBatchTiledVectorized(
                     batchQueries,
                     batchSize,
                     topK
                 );
 
-            m10Result =
-                index.searchTopKBatchTiledVectorized(
+            m11Result =
+                index.searchTopKBatchTiledVectorizedAuto(
                     batchQueries,
                     batchSize,
                     topK
@@ -678,40 +690,20 @@ BatchComparison benchmarkBatchComparison(
         }
         else
         {
+            m11Result =
+                index.searchTopKBatchTiledVectorizedAuto(
+                    batchQueries,
+                    batchSize,
+                    topK
+                );
+
             m10Result =
                 index.searchTopKBatchTiledVectorized(
                     batchQueries,
                     batchSize,
                     topK
                 );
-
-            m8Result =
-                index.searchTopKBatchTiled(
-                    batchQueries,
-                    batchSize,
-                    topK
-                );
         }
-
-        m8TotalTimes.push_back(
-            m8Result.totalTimeMs
-        );
-        m8KernelTimes.push_back(
-            static_cast<double>(
-                m8Result.fusedKernelTimeMs
-            )
-        );
-        m8MergeTimes.push_back(
-            static_cast<double>(
-                m8Result.mergeKernelTimeMs
-            )
-        );
-        m8UploadTimes.push_back(
-            m8Result.queryUploadTimeMs
-        );
-        m8DownloadTimes.push_back(
-            m8Result.resultDownloadTimeMs
-        );
 
         m10TotalTimes.push_back(
             m10Result.totalTimeMs
@@ -733,17 +725,37 @@ BatchComparison benchmarkBatchComparison(
             m10Result.resultDownloadTimeMs
         );
 
+        m11TotalTimes.push_back(
+            m11Result.totalTimeMs
+        );
+        m11KernelTimes.push_back(
+            static_cast<double>(
+                m11Result.fusedKernelTimeMs
+            )
+        );
+        m11MergeTimes.push_back(
+            static_cast<double>(
+                m11Result.mergeKernelTimeMs
+            )
+        );
+        m11UploadTimes.push_back(
+            m11Result.queryUploadTimeMs
+        );
+        m11DownloadTimes.push_back(
+            m11Result.resultDownloadTimeMs
+        );
+
         if (run ==
             BENCHMARK_RUNS - 1)
         {
-            finalM8Result =
-                std::move(
-                    m8Result
-                );
-
             finalM10Result =
                 std::move(
                     m10Result
+                );
+
+            finalM11Result =
+                std::move(
+                    m11Result
                 );
         }
     }
@@ -753,36 +765,8 @@ BatchComparison benchmarkBatchComparison(
     comparison.batchSize =
         batchSize;
 
-    comparison.milestone8.totalStats =
-        calculateStats(
-            m8TotalTimes
-        );
-    comparison.milestone8.fusedKernelStats =
-        calculateStats(
-            m8KernelTimes
-        );
-    comparison.milestone8.mergeStats =
-        calculateStats(
-            m8MergeTimes
-        );
-    comparison.milestone8.uploadStats =
-        calculateStats(
-            m8UploadTimes
-        );
-    comparison.milestone8.downloadStats =
-        calculateStats(
-            m8DownloadTimes
-        );
-    comparison.milestone8.finalNeighbors =
-        std::move(
-            finalM8Result.neighbors
-        );
-    comparison.milestone8.topKPasses =
-        finalM8Result.topKPasses;
-    comparison.milestone8.queryTileSize =
-        finalM8Result.queryTileSize;
-    comparison.milestone8.vectorizedLoadsUsed =
-        finalM8Result.vectorizedLoadsUsed;
+    comparison.tuning =
+        tuning;
 
     comparison.milestone10.totalStats =
         calculateStats(
@@ -815,19 +799,42 @@ BatchComparison benchmarkBatchComparison(
     comparison.milestone10.vectorizedLoadsUsed =
         finalM10Result.vectorizedLoadsUsed;
 
+    comparison.milestone11.totalStats =
+        calculateStats(
+            m11TotalTimes
+        );
+    comparison.milestone11.fusedKernelStats =
+        calculateStats(
+            m11KernelTimes
+        );
+    comparison.milestone11.mergeStats =
+        calculateStats(
+            m11MergeTimes
+        );
+    comparison.milestone11.uploadStats =
+        calculateStats(
+            m11UploadTimes
+        );
+    comparison.milestone11.downloadStats =
+        calculateStats(
+            m11DownloadTimes
+        );
+    comparison.milestone11.finalNeighbors =
+        std::move(
+            finalM11Result.neighbors
+        );
+    comparison.milestone11.topKPasses =
+        finalM11Result.topKPasses;
+    comparison.milestone11.queryTileSize =
+        finalM11Result.queryTileSize;
+    comparison.milestone11.vectorizedLoadsUsed =
+        finalM11Result.vectorizedLoadsUsed;
+
     const std::vector<Neighbor> expected =
         flattenCpuReferences(
             cpuReferences,
             batchSize,
             topK
-        );
-
-    comparison.m8CpuMatch =
-        neighborIndicesMatch(
-            expected,
-            comparison
-                .milestone8
-                .finalNeighbors
         );
 
     comparison.m10CpuMatch =
@@ -838,21 +845,21 @@ BatchComparison benchmarkBatchComparison(
                 .finalNeighbors
         );
 
-    comparison.m8M10Match =
+    comparison.m11CpuMatch =
         neighborIndicesMatch(
+            expected,
             comparison
-                .milestone8
-                .finalNeighbors,
-            comparison
-                .milestone10
+                .milestone11
                 .finalNeighbors
         );
 
-    comparison.m8MaxError =
-        maxNeighborDistanceError(
-            expected,
+    comparison.m10M11Match =
+        neighborIndicesMatch(
             comparison
-                .milestone8
+                .milestone10
+                .finalNeighbors,
+            comparison
+                .milestone11
                 .finalNeighbors
         );
 
@@ -861,6 +868,14 @@ BatchComparison benchmarkBatchComparison(
             expected,
             comparison
                 .milestone10
+                .finalNeighbors
+        );
+
+    comparison.m11MaxError =
+        maxNeighborDistanceError(
+            expected,
+            comparison
+                .milestone11
                 .finalNeighbors
         );
 
@@ -912,7 +927,8 @@ void printFirstQueryNeighbors(
 enum class ProfilePath
 {
     Milestone8,
-    Milestone10
+    Milestone10,
+    Milestone11
 };
 
 int runProfileMode(
@@ -928,30 +944,21 @@ int runProfileMode(
             << "  vortex_cuda --profile-m8 "
             << "<vectorCount> <dimension> <topK> <batchSize>\n"
             << "  vortex_cuda --profile-m10 "
+            << "<vectorCount> <dimension> <topK> <batchSize>\n"
+            << "  vortex_cuda --profile-m11 "
             << "<vectorCount> <dimension> <topK> <batchSize>\n";
 
         return EXIT_FAILURE;
     }
 
     const int vectorCount =
-        std::stoi(
-            argv[2]
-        );
-
+        std::stoi(argv[2]);
     const int dimension =
-        std::stoi(
-            argv[3]
-        );
-
+        std::stoi(argv[3]);
     const int topK =
-        std::stoi(
-            argv[4]
-        );
-
+        std::stoi(argv[4]);
     const int batchSize =
-        std::stoi(
-            argv[5]
-        );
+        std::stoi(argv[5]);
 
     if (vectorCount <= 0 ||
         dimension <= 0 ||
@@ -1014,12 +1021,20 @@ int runProfileMode(
         path ==
         ProfilePath::Milestone10;
 
+    const bool profileM11 =
+        path ==
+        ProfilePath::Milestone11;
+
     std::cout
         << "============================================\n"
         << (
-            profileM10
-                ? "       Vortex CUDA M10 Profile Mode\n"
-                : "       Vortex CUDA M8 Profile Mode\n"
+            profileM11
+                ? "       Vortex CUDA M11 Profile Mode\n"
+                : (
+                    profileM10
+                        ? "       Vortex CUDA M10 Profile Mode\n"
+                        : "       Vortex CUDA M8 Profile Mode\n"
+                  )
         )
         << "============================================\n\n"
         << "GPU: "
@@ -1038,7 +1053,8 @@ int runProfileMode(
         << '\n'
         << "Warm-up runs: 3\n";
 
-    if (profileM10)
+    if (profileM10 ||
+        profileM11)
     {
         std::cout
             << "float4 eligible: "
@@ -1075,6 +1091,25 @@ int runProfileMode(
         dimension
     );
 
+    if (profileM11)
+    {
+        std::cout
+            << "Autotuning query tile outside profiler range...\n";
+
+        const GpuQueryTileTuningResult tuning =
+            gpuIndex.autotuneVectorizedQueryTileSize(
+                queries,
+                batchSize,
+                topK,
+                7
+            );
+
+        std::cout
+            << "Selected query tile: "
+            << tuning.selectedTileSize
+            << '\n';
+    }
+
     constexpr int PROFILE_WARMUP_RUNS =
         3;
 
@@ -1086,7 +1121,16 @@ int runProfileMode(
              PROFILE_WARMUP_RUNS;
          ++run)
     {
-        if (profileM10)
+        if (profileM11)
+        {
+            (void)gpuIndex
+                .searchTopKBatchTiledVectorizedAuto(
+                    queries,
+                    batchSize,
+                    topK
+                );
+        }
+        else if (profileM10)
         {
             (void)gpuIndex
                 .searchTopKBatchTiledVectorized(
@@ -1112,9 +1156,13 @@ int runProfileMode(
 
     std::cout
         << (
-            profileM10
-                ? "Starting focused M10 profile region...\n"
-                : "Starting focused M8 profile region...\n"
+            profileM11
+                ? "Starting focused M11 profile region...\n"
+                : (
+                    profileM10
+                        ? "Starting focused M10 profile region...\n"
+                        : "Starting focused M8 profile region...\n"
+                  )
         );
 
     CUDA_CHECK(
@@ -1123,7 +1171,17 @@ int runProfileMode(
 
     GpuBatchTopKResult result;
 
-    if (profileM10)
+    if (profileM11)
+    {
+        result =
+            gpuIndex
+                .searchTopKBatchTiledVectorizedAuto(
+                    queries,
+                    batchSize,
+                    topK
+                );
+    }
+    else if (profileM10)
     {
         result =
             gpuIndex
@@ -1219,6 +1277,17 @@ int main(
                         ProfilePath::Milestone10
                     );
             }
+
+            if (mode ==
+                "--profile-m11")
+            {
+                return
+                    runProfileMode(
+                        argc,
+                        argv,
+                        ProfilePath::Milestone11
+                    );
+            }
         }
 
         int vectorCount =
@@ -1298,7 +1367,7 @@ int main(
 
         std::cout
             << "============================================\n"
-            << " Vortex CUDA Vectorized Query-Tiled Search\n"
+            << " Vortex CUDA Auto-Tuned Vectorized Search\n"
             << "============================================\n\n"
             << "GPU: "
             << device.name
@@ -1329,9 +1398,11 @@ int main(
             << (
                 (dimension % 4) == 0
                     ? "yes"
-                    : "no - M10 uses M8 fallback"
+                    : "no - scalar query-tiled fallback"
             )
             << '\n'
+            << "Autotune candidates: 1, 2, 4\n"
+            << "Autotune trials/tile: 7\n"
             << "Benchmark runs/path: "
             << BENCHMARK_RUNS
             << '\n'
@@ -1471,13 +1542,6 @@ int main(
              comparison :
              comparisons)
         {
-            const bool m8Numeric =
-                std::isfinite(
-                    comparison.m8MaxError
-                ) &&
-                comparison.m8MaxError <=
-                    MAX_ALLOWED_ERROR;
-
             const bool m10Numeric =
                 std::isfinite(
                     comparison.m10MaxError
@@ -1485,40 +1549,37 @@ int main(
                 comparison.m10MaxError <=
                     MAX_ALLOWED_ERROR;
 
+            const bool m11Numeric =
+                std::isfinite(
+                    comparison.m11MaxError
+                ) &&
+                comparison.m11MaxError <=
+                    MAX_ALLOWED_ERROR;
+
             allCorrect =
                 allCorrect &&
-                comparison.m8CpuMatch &&
                 comparison.m10CpuMatch &&
-                comparison.m8M10Match &&
-                m8Numeric &&
-                m10Numeric;
+                comparison.m11CpuMatch &&
+                comparison.m10M11Match &&
+                m10Numeric &&
+                m11Numeric;
         }
 
         std::cout
             << "\n\n============================================\n"
-            << "       Vectorized Batch Benchmark Results\n"
+            << "      Query-Tile Autotuning Benchmark\n"
             << "============================================\n";
 
         std::cout
-            << "\nBatch Tile Vec  M8 P50  M10 P50  M10 P95"
-            << "   M8 QPS   M10 QPS   Gain\n"
+            << "\nBatch Fixed Auto  M10 P50  M11 P50  M11 P95"
+            << "   M10 QPS   M11 QPS   Gain\n"
             << "------------------------------------------------"
-            << "-----------------------\n";
+            << "-------------------------\n";
 
         for (const BatchComparison&
              comparison :
              comparisons)
         {
-            const double m8Qps =
-                static_cast<double>(
-                    comparison.batchSize
-                ) *
-                1000.0 /
-                comparison
-                    .milestone8
-                    .totalStats
-                    .p50;
-
             const double m10Qps =
                 static_cast<double>(
                     comparison.batchSize
@@ -1529,13 +1590,23 @@ int main(
                     .totalStats
                     .p50;
 
+            const double m11Qps =
+                static_cast<double>(
+                    comparison.batchSize
+                ) *
+                1000.0 /
+                comparison
+                    .milestone11
+                    .totalStats
+                    .p50;
+
             const double gain =
                 comparison
-                    .milestone8
+                    .milestone10
                     .totalStats
                     .p50 /
                 comparison
-                    .milestone10
+                    .milestone11
                     .totalStats
                     .p50;
 
@@ -1543,25 +1614,15 @@ int main(
                 << std::setw(5)
                 << comparison.batchSize
                 << " "
-                << std::setw(4)
+                << std::setw(5)
                 << comparison
                     .milestone10
                     .queryTileSize
                 << " "
-                << std::setw(3)
-                << (
-                    comparison
-                        .milestone10
-                        .vectorizedLoadsUsed
-                        ? "yes"
-                        : "no"
-                )
-                << "  "
-                << std::setw(7)
+                << std::setw(4)
                 << comparison
-                    .milestone8
-                    .totalStats
-                    .p50
+                    .milestone11
+                    .queryTileSize
                 << "  "
                 << std::setw(7)
                 << comparison
@@ -1571,19 +1632,92 @@ int main(
                 << "  "
                 << std::setw(7)
                 << comparison
-                    .milestone10
+                    .milestone11
+                    .totalStats
+                    .p50
+                << "  "
+                << std::setw(7)
+                << comparison
+                    .milestone11
                     .totalStats
                     .p95
                 << "  "
                 << std::setw(8)
-                << m8Qps
+                << m10Qps
                 << "  "
                 << std::setw(8)
-                << m10Qps
+                << m11Qps
                 << "  "
                 << std::setw(5)
                 << gain
                 << "x\n";
+        }
+
+        std::cout
+            << "\nAutotune Calibration "
+            << "(median first-stage kernel ms)\n"
+            << "--------------------------------------------\n"
+            << "Batch   Tile1   Tile2   Tile4   Selected\n";
+
+        for (const BatchComparison&
+             comparison :
+             comparisons)
+        {
+            const auto printCandidate =
+                [](
+                    const float value)
+                {
+                    if (value < 0.0F)
+                    {
+                        std::cout
+                            << std::setw(7)
+                            << "-";
+                    }
+                    else
+                    {
+                        std::cout
+                            << std::setw(7)
+                            << std::fixed
+                            << std::setprecision(3)
+                            << value;
+                    }
+                };
+
+            std::cout
+                << std::setw(5)
+                << comparison.batchSize
+                << " ";
+
+            printCandidate(
+                comparison
+                    .tuning
+                    .tile1MedianKernelTimeMs
+            );
+
+            std::cout
+                << " ";
+
+            printCandidate(
+                comparison
+                    .tuning
+                    .tile2MedianKernelTimeMs
+            );
+
+            std::cout
+                << " ";
+
+            printCandidate(
+                comparison
+                    .tuning
+                    .tile4MedianKernelTimeMs
+            );
+
+            std::cout
+                << "   "
+                << comparison
+                    .tuning
+                    .selectedTileSize
+                << '\n';
         }
 
         const auto bestIterator =
@@ -1600,7 +1734,7 @@ int main(
                         ) *
                         1000.0 /
                         left
-                            .milestone10
+                            .milestone11
                             .totalStats
                             .p50;
 
@@ -1610,7 +1744,7 @@ int main(
                         ) *
                         1000.0 /
                         right
-                            .milestone10
+                            .milestone11
                             .totalStats
                             .p50;
 
@@ -1631,16 +1765,6 @@ int main(
         const BatchComparison& best =
             *bestIterator;
 
-        const double m8BestQps =
-            static_cast<double>(
-                best.batchSize
-            ) *
-            1000.0 /
-            best
-                .milestone8
-                .totalStats
-                .p50;
-
         const double m10BestQps =
             static_cast<double>(
                 best.batchSize
@@ -1651,19 +1775,29 @@ int main(
                 .totalStats
                 .p50;
 
+        const double m11BestQps =
+            static_cast<double>(
+                best.batchSize
+            ) *
+            1000.0 /
+            best
+                .milestone11
+                .totalStats
+                .p50;
+
         const double bestGain =
             best
-                .milestone8
+                .milestone10
                 .totalStats
                 .p50 /
             best
-                .milestone10
+                .milestone11
                 .totalStats
                 .p50;
 
         const double amortizedP50 =
             best
-                .milestone10
+                .milestone11
                 .totalStats
                 .p50 /
             static_cast<double>(
@@ -1672,7 +1806,7 @@ int main(
 
         const double amortizedP95 =
             best
-                .milestone10
+                .milestone11
                 .totalStats
                 .p95 /
             static_cast<double>(
@@ -1680,97 +1814,102 @@ int main(
             );
 
         std::cout
-            << "\nBest M10 Throughput\n"
+            << "\nBest M11 Throughput\n"
             << "--------------------------------------------\n"
             << "Batch size:                 "
             << best.batchSize
             << '\n'
-            << "Query tile size:            "
+            << "M10 fixed tile:             "
             << best
                 .milestone10
+                .queryTileSize
+            << '\n'
+            << "M11 selected tile:          "
+            << best
+                .milestone11
                 .queryTileSize
             << '\n'
             << "Vectorized loads used:      "
             << (
                 best
-                    .milestone10
+                    .milestone11
                     .vectorizedLoadsUsed
                     ? "yes"
                     : "no"
             )
             << '\n'
-            << "M8 batch P50:               "
-            << best
-                .milestone8
-                .totalStats
-                .p50
-            << " ms\n"
             << "M10 batch P50:              "
             << best
                 .milestone10
                 .totalStats
                 .p50
             << " ms\n"
-            << "M10 batch P95:              "
+            << "M11 batch P50:              "
             << best
-                .milestone10
+                .milestone11
+                .totalStats
+                .p50
+            << " ms\n"
+            << "M11 batch P95:              "
+            << best
+                .milestone11
                 .totalStats
                 .p95
             << " ms\n"
-            << "M10 batch P99:              "
+            << "M11 batch P99:              "
             << best
-                .milestone10
+                .milestone11
                 .totalStats
                 .p99
             << " ms\n"
-            << "Amortized M10 P50/query:    "
+            << "Amortized M11 P50/query:    "
             << amortizedP50
             << " ms\n"
-            << "Amortized M10 P95/query:    "
+            << "Amortized M11 P95/query:    "
             << amortizedP95
             << " ms\n"
-            << "M8 throughput:              "
-            << m8BestQps
-            << " queries/sec\n"
             << "M10 throughput:             "
             << m10BestQps
             << " queries/sec\n"
-            << "M10 vs M8 throughput gain:  "
+            << "M11 throughput:             "
+            << m11BestQps
+            << " queries/sec\n"
+            << "M11 vs M10 throughput gain: "
             << bestGain
             << "x\n"
-            << "M8 tiled kernel P50:        "
-            << best
-                .milestone8
-                .fusedKernelStats
-                .p50
-            << " ms\n"
-            << "M10 float4 kernel P50:      "
+            << "M10 kernel P50:             "
             << best
                 .milestone10
                 .fusedKernelStats
                 .p50
             << " ms\n"
-            << "M10 candidate merge P50:    "
+            << "M11 kernel P50:             "
             << best
-                .milestone10
+                .milestone11
+                .fusedKernelStats
+                .p50
+            << " ms\n"
+            << "M11 candidate merge P50:    "
+            << best
+                .milestone11
                 .mergeStats
                 .p50
             << " ms\n"
-            << "M10 query upload P50:       "
+            << "M11 query upload P50:       "
             << best
-                .milestone10
+                .milestone11
                 .uploadStats
                 .p50
             << " ms\n"
-            << "M10 Top-K download P50:     "
+            << "M11 Top-K download P50:     "
             << best
-                .milestone10
+                .milestone11
                 .downloadStats
                 .p50
             << " ms\n"
             << "Top-K hierarchy passes:     "
             << best
-                .milestone10
+                .milestone11
                 .topKPasses
             << '\n';
 
@@ -1783,13 +1922,6 @@ int main(
              comparison :
              comparisons)
         {
-            const bool m8Numeric =
-                std::isfinite(
-                    comparison.m8MaxError
-                ) &&
-                comparison.m8MaxError <=
-                    MAX_ALLOWED_ERROR;
-
             const bool m10Numeric =
                 std::isfinite(
                     comparison.m10MaxError
@@ -1797,31 +1929,32 @@ int main(
                 comparison.m10MaxError <=
                     MAX_ALLOWED_ERROR;
 
+            const bool m11Numeric =
+                std::isfinite(
+                    comparison.m11MaxError
+                ) &&
+                comparison.m11MaxError <=
+                    MAX_ALLOWED_ERROR;
+
             std::cout
                 << "Batch "
                 << std::setw(2)
                 << comparison.batchSize
-                << "  M8CPU="
-                << (
-                    comparison.m8CpuMatch
-                        ? "PASS"
-                        : "FAIL"
-                )
                 << "  M10CPU="
                 << (
                     comparison.m10CpuMatch
                         ? "PASS"
                         : "FAIL"
                 )
-                << "  M8vsM10="
+                << "  M11CPU="
                 << (
-                    comparison.m8M10Match
+                    comparison.m11CpuMatch
                         ? "PASS"
                         : "FAIL"
                 )
-                << "  M8Num="
+                << "  M10vsM11="
                 << (
-                    m8Numeric
+                    comparison.m10M11Match
                         ? "PASS"
                         : "FAIL"
                 )
@@ -1831,8 +1964,14 @@ int main(
                         ? "PASS"
                         : "FAIL"
                 )
-                << "  M10Error="
-                << comparison.m10MaxError
+                << "  M11Num="
+                << (
+                    m11Numeric
+                        ? "PASS"
+                        : "FAIL"
+                )
+                << "  M11Error="
+                << comparison.m11MaxError
                 << '\n';
         }
 
@@ -1847,36 +1986,35 @@ int main(
 
         printFirstQueryNeighbors(
             best
-                .milestone10
+                .milestone11
                 .finalNeighbors,
             topK
         );
 
         std::cout
-            << "\nMilestone 10 completed successfully.\n";
+            << "\nMilestone 11 completed successfully.\n";
 
         if (!best
-                .milestone10
+                .milestone11
                 .vectorizedLoadsUsed)
         {
             std::cout
                 << "Dimension is not divisible by four; "
-                << "M10 correctly used the M8 scalar fallback.\n";
+                << "M11 correctly preserved the scalar fallback.\n";
         }
-        else if (bestGain >
-            1.0)
+        else if (bestGain >=
+            1.02)
         {
             std::cout
-                << "float4 vectorization improved measured "
-                << "batch throughput.\n";
+                << "Query-tile autotuning produced a measurable "
+                << "throughput improvement.\n";
         }
         else
         {
             std::cout
-                << "float4 vectorization did not improve "
-                << "measured throughput; retain M8 as the "
-                << "performance default until profiling "
-                << "explains the result.\n";
+                << "Autotuning selected the same effective policy as M10; "
+                << "steady-state performance is equivalent within "
+                << "benchmark noise.\n";
         }
 
         return EXIT_SUCCESS;

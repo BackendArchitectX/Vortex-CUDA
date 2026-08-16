@@ -1,0 +1,59 @@
+# ==============================
+# Build output
+# ==============================
+build/
+cmake-build-*/
+out/
+
+# ==============================
+# CMake generated files
+# ==============================
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# ==============================
+# IntelliJ / JetBrains
+# ==============================
+.idea/
+*.iml
+
+# ==============================
+# Visual Studio / MSVC
+# ==============================
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# ==============================
+# Compiled binaries
+# ==============================
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.exp
+*.ilk
+
+# ==============================
+# CUDA generated artifacts
+# ==============================
+*.cubin
+*.fatbin
+*.ptx
+
+# ==============================
+# Temporary files
+# ==============================
+*.tmp
+*.log
+
+# ==============================
+# OS files
+# ==============================
+.DS_Store
+Thumbs.db

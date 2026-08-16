@@ -56,5 +56,9 @@ Makefile
 # OS files
 # ==============================
 .DS_Store
-Thumbs.dbbenchmark_results/
+Thumbs.db
+
+
+# Generated benchmark artifacts
+benchmark_results/
 benchmark_results_full/

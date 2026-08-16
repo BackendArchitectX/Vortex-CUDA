@@ -1,5 +1,6 @@
 package com.vortex.server.health;
 
+import com.vortex.cuda.CudaDeviceInfo;
 import com.vortex.cuda.VortexRuntime;
 
 import org.springframework.boot.health.contributor.Health;
@@ -13,17 +14,29 @@ public final class VortexNativeHealthIndicator
     @Override
     public Health health() {
         try {
-            String version =
-                    VortexRuntime.nativeVersion();
+            CudaDeviceInfo device =
+                    VortexRuntime.deviceInfo();
 
             return Health.up()
                     .withDetail(
                             "nativeVersion",
-                            version
+                            VortexRuntime.nativeVersion()
                     )
                     .withDetail(
                             "engine",
                             "CUDA JNI"
+                    )
+                    .withDetail(
+                            "device",
+                            device.name()
+                    )
+                    .withDetail(
+                            "computeCapability",
+                            device.computeCapability()
+                    )
+                    .withDetail(
+                            "freeMemoryBytes",
+                            device.freeMemoryBytes()
                     )
                     .build();
         } catch (LinkageError | RuntimeException exception) {

@@ -18,6 +18,24 @@ public record VortexLimitsProperties(
         int maxDimension,
 
         @Min(1)
-        long maxIndexElements
+        long maxIndexElements,
+
+        @Min(1)
+        @Max(1_024)
+        int maxActiveIndexes,
+
+        @Min(1)
+        long maxResidentVectorBytes,
+
+        @Min(1)
+        @Max(256)
+        int maxConcurrentSearches,
+
+        @Min(0)
+        @Max(60_000)
+        long searchAcquireTimeoutMs,
+
+        @Min(1_024)
+        long maxRequestBytes
 ) {
 }

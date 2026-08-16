@@ -1,11 +1,18 @@
 package com.vortex.server.api;
 
+import com.vortex.server.service.IndexCapacityExceededException;
 import com.vortex.server.service.IndexNotFoundException;
+import com.vortex.server.service.SearchCapacityExceededException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -17,6 +24,11 @@ import java.util.stream.Collectors;
 @RestControllerAdvice
 public final class ApiExceptionHandler {
 
+    private static final Logger LOGGER =
+            LoggerFactory.getLogger(
+                    ApiExceptionHandler.class
+            );
+
     @ExceptionHandler(IndexNotFoundException.class)
     public ResponseEntity<ProblemDetail> notFound(
             IndexNotFoundException exception
@@ -24,6 +36,28 @@ public final class ApiExceptionHandler {
         return problem(
                 HttpStatus.NOT_FOUND,
                 "INDEX_NOT_FOUND",
+                exception.getMessage()
+        );
+    }
+
+    @ExceptionHandler(IndexCapacityExceededException.class)
+    public ResponseEntity<ProblemDetail> indexCapacity(
+            IndexCapacityExceededException exception
+    ) {
+        return problem(
+                HttpStatus.INSUFFICIENT_STORAGE,
+                "INDEX_CAPACITY_EXCEEDED",
+                exception.getMessage()
+        );
+    }
+
+    @ExceptionHandler(SearchCapacityExceededException.class)
+    public ResponseEntity<ProblemDetail> searchCapacity(
+            SearchCapacityExceededException exception
+    ) {
+        return problem(
+                HttpStatus.TOO_MANY_REQUESTS,
+                "SEARCH_CAPACITY_EXCEEDED",
                 exception.getMessage()
         );
     }
@@ -80,10 +114,15 @@ public final class ApiExceptionHandler {
     public ResponseEntity<ProblemDetail> nativeFailure(
             IllegalStateException exception
     ) {
+        LOGGER.error(
+                "Native engine failure",
+                exception
+        );
+
         return problem(
                 HttpStatus.SERVICE_UNAVAILABLE,
                 "NATIVE_ENGINE_UNAVAILABLE",
-                exception.getMessage()
+                "The native CUDA engine is temporarily unavailable."
         );
     }
 
@@ -91,6 +130,11 @@ public final class ApiExceptionHandler {
     public ResponseEntity<ProblemDetail> unexpected(
             Exception exception
     ) {
+        LOGGER.error(
+                "Unexpected server failure",
+                exception
+        );
+
         return problem(
                 HttpStatus.INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -129,6 +173,18 @@ public final class ApiExceptionHandler {
                 "timestamp",
                 Instant.now()
         );
+
+        String requestId =
+                MDC.get(
+                        "requestId"
+                );
+
+        if (requestId != null) {
+            problem.setProperty(
+                    "requestId",
+                    requestId
+            );
+        }
 
         return ResponseEntity
                 .status(status)

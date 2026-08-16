@@ -16,6 +16,7 @@ final class ManagedIndex
     private final UUID id;
     private final Instant createdAt;
     private final VortexIndex index;
+    private final long residentVectorBytes;
 
     private final ReentrantReadWriteLock lifecycleLock =
             new ReentrantReadWriteLock();
@@ -30,11 +31,22 @@ final class ManagedIndex
     ) {
         this.id = id;
         this.createdAt = Instant.now();
-        this.index = new VortexIndex(
-                database,
-                vectorCount,
-                dimension
-        );
+
+        this.index =
+                new VortexIndex(
+                        database,
+                        vectorCount,
+                        dimension
+                );
+
+        IndexStats initialStats =
+                this.index.stats();
+
+        this.residentVectorBytes =
+                Math.addExact(
+                        initialStats.fp32IndexBytes(),
+                        initialStats.fp16IndexBytes()
+                );
     }
 
     UUID id() {
@@ -53,6 +65,10 @@ final class ManagedIndex
         return index.dimension();
     }
 
+    long residentVectorBytes() {
+        return residentVectorBytes;
+    }
+
     IndexStats stats() {
         ReentrantReadWriteLock.ReadLock readLock =
                 lifecycleLock.readLock();
@@ -61,6 +77,7 @@ final class ManagedIndex
 
         try {
             ensureOpen();
+
             return index.stats();
         } finally {
             readLock.unlock();
@@ -137,7 +154,8 @@ final class ManagedIndex
     private void ensureOpen() {
         if (closed) {
             throw new IllegalStateException(
-                    "Vortex index is closed: " + id
+                    "Vortex index is closed: " +
+                            id
             );
         }
     }

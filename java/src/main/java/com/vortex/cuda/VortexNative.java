@@ -38,6 +38,20 @@ final class VortexNative {
 
     static native String nativeVersion();
 
+    static native String nativeDeviceName();
+
+    static native int nativeComputeCapabilityMajor();
+
+    static native int nativeComputeCapabilityMinor();
+
+    static native long nativeCudaFreeMemoryBytes();
+
+    static native long nativeCudaTotalMemoryBytes();
+
+    static native int nativeCudaRuntimeVersion();
+
+    static native int nativeCudaDriverVersion();
+
     static native long nativeCreateIndex(
             float[] database,
             int vectorCount,

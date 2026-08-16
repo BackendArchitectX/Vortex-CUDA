@@ -1,10 +1,13 @@
 package com.vortex.server.service;
 
 import com.vortex.cuda.BatchSearchResult;
+import com.vortex.cuda.CudaDeviceInfo;
 import com.vortex.cuda.IndexStats;
 import com.vortex.cuda.Neighbor;
 import com.vortex.cuda.SearchPrecision;
 import com.vortex.cuda.SearchResult;
+import com.vortex.cuda.VortexRuntime;
+
 import com.vortex.server.api.dto.BatchSearchRequest;
 import com.vortex.server.api.dto.BatchSearchResponse;
 import com.vortex.server.api.dto.CreateIndexRequest;
@@ -14,6 +17,7 @@ import com.vortex.server.api.dto.IndexStatsResponse;
 import com.vortex.server.api.dto.NeighborResponse;
 import com.vortex.server.api.dto.SearchRequest;
 import com.vortex.server.api.dto.SearchResponse;
+import com.vortex.server.api.dto.SystemInfoResponse;
 import com.vortex.server.config.VortexLimitsProperties;
 
 import io.micrometer.core.instrument.Counter;
@@ -26,7 +30,9 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 @Service
 public final class VortexIndexService {
@@ -38,10 +44,14 @@ public final class VortexIndexService {
     private final VortexLimitsProperties limits;
     private final MeterRegistry meterRegistry;
 
-    private final Counter createdCounter;
+    private final Semaphore searchPermits;
+
+    private final Counter jsonCreatedCounter;
+    private final Counter binaryCreatedCounter;
     private final Counter deletedCounter;
-    private final Counter searchCounter;
+    private final Counter singleSearchCounter;
     private final Counter batchSearchCounter;
+    private final Counter rejectedSearchCounter;
 
     public VortexIndexService(
             VortexIndexRegistry indexRegistry,
@@ -52,33 +62,75 @@ public final class VortexIndexService {
         this.limits = limits;
         this.meterRegistry = meterRegistry;
 
-        this.createdCounter = Counter.builder(
-                        "vortex.index.created"
-                )
-                .description(
-                        "Number of native Vortex indexes created"
-                )
-                .register(meterRegistry);
+        this.searchPermits =
+                new Semaphore(
+                        limits.maxConcurrentSearches(),
+                        true
+                );
 
-        this.deletedCounter = Counter.builder(
-                        "vortex.index.deleted"
-                )
-                .description(
-                        "Number of native Vortex indexes deleted"
-                )
-                .register(meterRegistry);
+        this.jsonCreatedCounter =
+                Counter.builder(
+                                "vortex.index.created"
+                        )
+                        .tag(
+                                "ingest",
+                                "json"
+                        )
+                        .description(
+                                "Number of native Vortex indexes created"
+                        )
+                        .register(meterRegistry);
 
-        this.searchCounter = Counter.builder(
-                        "vortex.search.requests"
-                )
-                .tag("mode", "single")
-                .register(meterRegistry);
+        this.binaryCreatedCounter =
+                Counter.builder(
+                                "vortex.index.created"
+                        )
+                        .tag(
+                                "ingest",
+                                "binary"
+                        )
+                        .description(
+                                "Number of native Vortex indexes created through binary ingestion"
+                        )
+                        .register(meterRegistry);
 
-        this.batchSearchCounter = Counter.builder(
-                        "vortex.search.requests"
-                )
-                .tag("mode", "batch")
-                .register(meterRegistry);
+        this.deletedCounter =
+                Counter.builder(
+                                "vortex.index.deleted"
+                        )
+                        .description(
+                                "Number of native Vortex indexes deleted"
+                        )
+                        .register(meterRegistry);
+
+        this.singleSearchCounter =
+                Counter.builder(
+                                "vortex.search.requests"
+                        )
+                        .tag(
+                                "mode",
+                                "single"
+                        )
+                        .register(meterRegistry);
+
+        this.batchSearchCounter =
+                Counter.builder(
+                                "vortex.search.requests"
+                        )
+                        .tag(
+                                "mode",
+                                "batch"
+                        )
+                        .register(meterRegistry);
+
+        this.rejectedSearchCounter =
+                Counter.builder(
+                                "vortex.search.rejected"
+                        )
+                        .description(
+                                "Searches rejected because GPU concurrency capacity was unavailable"
+                        )
+                        .register(meterRegistry);
 
         Gauge.builder(
                         "vortex.index.active",
@@ -89,26 +141,61 @@ public final class VortexIndexService {
                         "Number of active native Vortex indexes"
                 )
                 .register(meterRegistry);
+
+        Gauge.builder(
+                        "vortex.index.resident.vector.bytes",
+                        indexRegistry,
+                        registry ->
+                                (double)
+                                        registry.residentVectorBytes()
+                )
+                .description(
+                        "Logical persistent FP32 plus FP16 vector storage currently resident on the GPU"
+                )
+                .register(meterRegistry);
+
+        Gauge.builder(
+                        "vortex.search.permits.available",
+                        searchPermits,
+                        semaphore ->
+                                (double)
+                                        semaphore.availablePermits()
+                )
+                .description(
+                        "Available global GPU search permits"
+                )
+                .register(meterRegistry);
     }
 
     public CreateIndexResponse create(
             CreateIndexRequest request
     ) {
-        validateCreateRequest(request);
+        return createInternal(
+                request.vectorCount(),
+                request.dimension(),
+                request.vectors(),
+                false
+        );
+    }
 
-        ManagedIndex managedIndex =
-                indexRegistry.create(
-                        request.vectors(),
-                        request.vectorCount(),
-                        request.dimension()
-                );
+    public CreateIndexResponse createBinary(
+            int vectorCount,
+            int dimension,
+            byte[] body
+    ) {
+        float[] vectors =
+                BinaryVectorCodec
+                        .decodeLittleEndianFloat32(
+                                body,
+                                vectorCount,
+                                dimension
+                        );
 
-        createdCounter.increment();
-
-        return new CreateIndexResponse(
-                toStatsResponse(
-                        managedIndex
-                )
+        return createInternal(
+                vectorCount,
+                dimension,
+                vectors,
+                true
         );
     }
 
@@ -131,6 +218,22 @@ public final class VortexIndexService {
         );
     }
 
+    public SystemInfoResponse systemInfo() {
+        CudaDeviceInfo deviceInfo =
+                VortexRuntime.deviceInfo();
+
+        return new SystemInfoResponse(
+                "M18",
+                VortexRuntime.nativeVersion(),
+                deviceInfo,
+                indexRegistry.size(),
+                indexRegistry.residentVectorBytes(),
+                limits.maxActiveIndexes(),
+                limits.maxResidentVectorBytes(),
+                limits.maxConcurrentSearches()
+        );
+    }
+
     public SearchResponse search(
             UUID id,
             SearchRequest request
@@ -148,25 +251,19 @@ public final class VortexIndexService {
                         request.precision()
                 );
 
-        long start = System.nanoTime();
+        SearchResult result =
+                executeWithPermit(
+                        "single",
+                        precision,
+                        () ->
+                                managedIndex.search(
+                                        request.query(),
+                                        request.topK(),
+                                        precision
+                                )
+                );
 
-        SearchResult result;
-
-        try {
-            result = managedIndex.search(
-                    request.query(),
-                    request.topK(),
-                    precision
-            );
-        } finally {
-            recordLatency(
-                    "single",
-                    precision,
-                    start
-            );
-        }
-
-        searchCounter.increment();
+        singleSearchCounter.increment();
 
         return new SearchResponse(
                 id,
@@ -193,24 +290,18 @@ public final class VortexIndexService {
                         request.precision()
                 );
 
-        long start = System.nanoTime();
-
-        BatchSearchResult result;
-
-        try {
-            result = managedIndex.searchBatch(
-                    request.queries(),
-                    request.queryCount(),
-                    request.topK(),
-                    precision
-            );
-        } finally {
-            recordLatency(
-                    "batch",
-                    precision,
-                    start
-            );
-        }
+        BatchSearchResult result =
+                executeWithPermit(
+                        "batch",
+                        precision,
+                        () ->
+                                managedIndex.searchBatch(
+                                        request.queries(),
+                                        request.queryCount(),
+                                        request.topK(),
+                                        precision
+                                )
+                );
 
         batchSearchCounter.increment();
 
@@ -249,10 +340,62 @@ public final class VortexIndexService {
         deletedCounter.increment();
     }
 
-    private void validateCreateRequest(
-            CreateIndexRequest request
+    private CreateIndexResponse createInternal(
+            int vectorCount,
+            int dimension,
+            float[] vectors,
+            boolean binaryIngest
     ) {
-        if (request.vectorCount() >
+        validateCreateRequest(
+                vectorCount,
+                dimension,
+                vectors
+        );
+
+        ManagedIndex managedIndex =
+                indexRegistry.create(
+                        vectors,
+                        vectorCount,
+                        dimension
+                );
+
+        if (binaryIngest) {
+            binaryCreatedCounter.increment();
+        } else {
+            jsonCreatedCounter.increment();
+        }
+
+        return new CreateIndexResponse(
+                toStatsResponse(
+                        managedIndex
+                )
+        );
+    }
+
+    private void validateCreateRequest(
+            int vectorCount,
+            int dimension,
+            float[] vectors
+    ) {
+        if (vectorCount <= 0) {
+            throw new IllegalArgumentException(
+                    "vectorCount must be positive."
+            );
+        }
+
+        if (dimension <= 0) {
+            throw new IllegalArgumentException(
+                    "dimension must be positive."
+            );
+        }
+
+        if (vectors == null) {
+            throw new IllegalArgumentException(
+                    "vectors must not be null."
+            );
+        }
+
+        if (vectorCount >
                 limits.maxVectorCount()) {
 
             throw new IllegalArgumentException(
@@ -261,7 +404,7 @@ public final class VortexIndexService {
             );
         }
 
-        if (request.dimension() >
+        if (dimension >
                 limits.maxDimension()) {
 
             throw new IllegalArgumentException(
@@ -272,8 +415,8 @@ public final class VortexIndexService {
 
         long expectedElements =
                 Math.multiplyExact(
-                        (long) request.vectorCount(),
-                        (long) request.dimension()
+                        (long) vectorCount,
+                        (long) dimension
                 );
 
         if (expectedElements >
@@ -287,19 +430,30 @@ public final class VortexIndexService {
             );
         }
 
-        if (request.vectors().length !=
+        if (vectors.length !=
                 expectedElements) {
 
             throw new IllegalArgumentException(
                     "vectors.length must equal vectorCount * dimension."
             );
         }
+
+        validateFinite(
+                vectors,
+                "vectors"
+        );
     }
 
     private void validateSingleSearch(
             ManagedIndex index,
             SearchRequest request
     ) {
+        if (request.query() == null) {
+            throw new IllegalArgumentException(
+                    "query must not be null."
+            );
+        }
+
         if (request.query().length !=
                 index.dimension()) {
 
@@ -308,6 +462,11 @@ public final class VortexIndexService {
                             index.dimension()
             );
         }
+
+        validateFinite(
+                request.query(),
+                "query"
+        );
 
         validateTopK(
                 request.topK(),
@@ -319,9 +478,17 @@ public final class VortexIndexService {
             ManagedIndex index,
             BatchSearchRequest request
     ) {
-        if (request.queryCount() > 32) {
+        if (request.queries() == null) {
             throw new IllegalArgumentException(
-                    "queryCount must not exceed 32."
+                    "queries must not be null."
+            );
+        }
+
+        if (request.queryCount() <= 0 ||
+                request.queryCount() > 32) {
+
+            throw new IllegalArgumentException(
+                    "queryCount must be between 1 and 32."
             );
         }
 
@@ -338,6 +505,11 @@ public final class VortexIndexService {
                     "queries.length must equal queryCount * index dimension."
             );
         }
+
+        validateFinite(
+                request.queries(),
+                "queries"
+        );
 
         validateTopK(
                 request.topK(),
@@ -356,6 +528,77 @@ public final class VortexIndexService {
             throw new IllegalArgumentException(
                     "topK must be between 1 and min(vectorCount, 32)."
             );
+        }
+    }
+
+    private static void validateFinite(
+            float[] values,
+            String name
+    ) {
+        for (int index = 0;
+             index < values.length;
+             index++) {
+
+            if (!Float.isFinite(
+                    values[index]
+            )) {
+                throw new IllegalArgumentException(
+                        name +
+                                " contains a non-finite value at index " +
+                                index +
+                                "."
+                );
+            }
+        }
+    }
+
+    private <T> T executeWithPermit(
+            String mode,
+            SearchPrecision precision,
+            Supplier<T> operation
+    ) {
+        boolean acquired = false;
+
+        try {
+            acquired =
+                    searchPermits.tryAcquire(
+                            limits.searchAcquireTimeoutMs(),
+                            TimeUnit.MILLISECONDS
+                    );
+
+            if (!acquired) {
+                rejectedSearchCounter.increment();
+
+                throw new SearchCapacityExceededException(
+                        "GPU search concurrency capacity is currently exhausted."
+                );
+            }
+
+            long start =
+                    System.nanoTime();
+
+            try {
+                return operation.get();
+            } finally {
+                recordLatency(
+                        mode,
+                        precision,
+                        start
+                );
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread()
+                    .interrupt();
+
+            rejectedSearchCounter.increment();
+
+            throw new SearchCapacityExceededException(
+                    "Interrupted while waiting for GPU search capacity."
+            );
+        } finally {
+            if (acquired) {
+                searchPermits.release();
+            }
         }
     }
 
@@ -427,7 +670,10 @@ public final class VortexIndexService {
                 .description(
                         "End-to-end Java service search latency"
                 )
-                .tag("mode", mode)
+                .tag(
+                        "mode",
+                        mode
+                )
                 .tag(
                         "precision",
                         precision.name()

@@ -1,0 +1,342 @@
+VORTEX CUDA — MILESTONE 18
+==========================
+
+STAGE
+-----
+M18 — Production Hardening + Final 1.0.0 Release
+
+BASELINE
+--------
+Install M18 only after M17 is complete and clean.
+
+Validated M17 baseline:
+63a8120 feat: add Spring Boot REST API for CUDA vector search
+
+M18 GOAL
+--------
+Turn the working M17 REST/JNI/CUDA stack into a final release with failure
+containment, capacity protection, API security, binary ingestion, runtime
+diagnostics, release packaging and final project documentation.
+
+WHAT M18 ADDS
+-------------
+1. Exception-based CUDA failure handling
+   - CUDA_CHECK no longer calls std::exit().
+   - CUDA errors become CudaException/std::exception.
+   - JNI translates native failures into Java exceptions.
+   - REST returns HTTP 503 without exposing native source paths.
+
+2. CUDA diagnostics
+   - GPU name
+   - compute capability
+   - free/total GPU memory
+   - CUDA runtime API version
+   - CUDA driver API version
+   - native version + Git commit + dirty/clean state
+
+3. Binary vector ingestion
+   POST /api/v1/indexes
+   Content-Type: application/octet-stream
+   X-Vortex-Vector-Count: N
+   X-Vortex-Dimension: D
+
+   Body = little-endian IEEE-754 float32 values.
+
+4. API hardening
+   - optional X-Vortex-Api-Key
+   - X-Request-ID correlation
+   - request Content-Length guard
+   - finite float validation
+   - hardened ProblemDetail responses
+
+5. Capacity controls
+   - maximum active indexes
+   - maximum persistent FP32+FP16 vector bytes
+   - global concurrent GPU search semaphore
+   - bounded search permit wait
+   - HTTP 507 for index capacity
+   - HTTP 429 for search capacity
+
+6. Operations
+   - fail-fast JNI/CUDA startup validation
+   - Actuator health/info/metrics
+   - resident vector-byte gauge
+   - available GPU search-permit gauge
+   - request logs with request IDs
+
+7. Release engineering
+   - unit tests for binary float32 decoding
+   - full M18 smoke test
+   - version 1.0.0
+   - README + architecture/API/benchmark/security docs
+   - .gitattributes line-ending policy
+   - .env.example
+   - release ZIP + SHA-256 manifest
+
+INSTALL
+-------
+Download:
+Vortex_CUDA_Final_Project_M18.zip
+
+PowerShell:
+
+$ErrorActionPreference = "Stop"
+
+$zip = "$HOME\Downloads\Vortex_CUDA_Final_Project_M18.zip"
+$temp = "$HOME\Downloads\Vortex_M18_Temp"
+$project = "D:\Github OSC\Vortex CUDA\Cuda"
+
+if (Test-Path $temp) {
+    Remove-Item $temp -Recurse -Force
+}
+
+Expand-Archive `
+    -Path $zip `
+    -DestinationPath $temp `
+    -Force
+
+$m18 = "$temp\Vortex_CUDA_Final_Project_M18"
+
+& "$m18\INSTALL_M18.ps1" `
+    -PackageRoot $m18 `
+    -ProjectRoot $project
+
+Set-Location $project
+
+VERIFY INSTALL
+--------------
+git status
+
+JAVA / JNI
+----------
+$javacCommand = Get-Command javac -ErrorAction Stop
+$javacExe = $javacCommand.Source
+$javaBin = Split-Path $javacExe -Parent
+$env:JAVA_HOME = Split-Path $javaBin -Parent
+
+java -version
+javac -version
+Test-Path "$env:JAVA_HOME\include\jni.h"
+
+Expected:
+True
+
+RUN FULL M18 VALIDATION
+-----------------------
+.\BUILD_AND_TEST_M18.ps1
+
+The script performs:
+
+- verifies CUDA_CHECK has no std::exit
+- clean native Release build
+- vortex_cuda.exe
+- vortex_benchmark.exe
+- vortex_jni.dll
+- Maven clean/package
+- unit tests
+- Spring Boot 1.0.0 startup
+- JNI/CUDA fail-fast check
+- health UP
+- API without key -> 401
+- authenticated /api/v1/system
+- binary float32 index ingestion
+- request-ID propagation
+- FP16 storage reduction check
+- max-active-index guard -> 507
+- FP32 exact deterministic self-query
+- FP16 deterministic self-query
+- deterministic batch search
+- topK=33 -> 400
+- metrics
+- DELETE -> 204
+- deleted index -> 404
+- server stop
+
+Expected:
+
+============================================
+ M18 PRODUCTION SMOKE TEST: PASS
+============================================
+
+MANUAL API SECURITY
+-------------------
+For a secured manual run:
+
+$env:VORTEX_API_KEY = "replace-with-a-long-random-secret"
+
+Then send:
+
+X-Vortex-Api-Key: <secret>
+
+If VORTEX_API_KEY is empty, API-key checking is disabled for local development.
+
+SYSTEM ENDPOINT
+---------------
+GET /api/v1/system
+
+Returns:
+- M18
+- native 1.0.0 version/build metadata
+- CUDA GPU name
+- compute capability
+- free/total GPU memory
+- CUDA runtime/driver versions
+- active index count
+- resident vector bytes
+- capacity settings
+
+BINARY INGESTION
+----------------
+POST /api/v1/indexes
+
+Headers:
+
+Content-Type: application/octet-stream
+X-Vortex-Vector-Count: <N>
+X-Vortex-Dimension: <D>
+X-Vortex-Api-Key: <secret>  # when enabled
+
+Body:
+N * D little-endian float32 values.
+
+See:
+docs/BINARY_FORMAT.md
+
+DEFAULT CAPACITY LIMITS
+-----------------------
+max vector count:          1,000,000
+max dimension:             4,096
+max index elements:        16,000,000
+max active indexes:        8
+max resident vector bytes: 1,610,612,736 (~1.5 GiB)
+max concurrent searches:   2
+search permit wait:        250 ms
+max Content-Length:        134,217,728 (128 MiB)
+
+These are service protection defaults, not physical GPU limits.
+
+REVIEW BEFORE COMMIT
+--------------------
+After the first M18 validation passes:
+
+git status
+git diff --check
+git diff --stat
+
+Because M18 adds .gitattributes, inspect the diff and avoid accidentally
+mass-normalizing unrelated historical files.
+
+STAGE
+-----
+git add `
+    .gitattributes `
+    .gitignore `
+    .env.example `
+    README.md `
+    CHANGELOG.md `
+    M18_INSTRUCTIONS.txt `
+    BUILD_AND_TEST_M18.ps1 `
+    PACKAGE_M18_RELEASE.ps1 `
+    CMakeLists.txt `
+    include/cuda_check.cuh `
+    src/vortex_jni.cpp `
+    pom.xml `
+    java/pom.xml `
+    java/src/main/java/com/vortex/cuda/VortexNative.java `
+    java/src/main/java/com/vortex/cuda/VortexRuntime.java `
+    java/src/main/java/com/vortex/cuda/CudaDeviceInfo.java `
+    server `
+    docs `
+    release
+
+Then:
+
+git status
+
+COMMIT
+------
+git commit -m "release: harden Vortex CUDA 1.0.0"
+
+VERIFY
+------
+git status
+git log --oneline -8
+
+Expected:
+nothing to commit, working tree clean
+
+CLEAN BUILD METADATA
+--------------------
+The first M18 build happens while M18 is uncommitted, so native metadata will
+correctly report dirty.
+
+After the commit:
+
+cmake `
+    -S . `
+    -B build `
+    -G "Visual Studio 17 2022" `
+    -A x64
+
+cmake --build build --config Release --clean-first
+
+Look for:
+
+VORTEX_GIT_COMMIT="<new M18 hash>"
+VORTEX_GIT_DIRTY=0
+
+Then rerun:
+
+.\BUILD_AND_TEST_M18.ps1
+
+TAG
+---
+After the clean post-commit PASS:
+
+git tag -a v1.0.0 -m "Vortex CUDA 1.0.0"
+
+Verify:
+
+git tag --list
+git show --no-patch v1.0.0
+
+PACKAGE FINAL RELEASE
+---------------------
+Only after Git is clean:
+
+.\PACKAGE_M18_RELEASE.ps1
+
+Expected:
+
+dist\vortex-cuda-1.0.0-windows-x64\
+dist\vortex-cuda-1.0.0-windows-x64.zip
+
+Contents include:
+
+- vortex_jni.dll
+- vortex_cuda.exe
+- vortex_benchmark.exe
+- vortex-server-1.0.0.jar
+- production config
+- RUN_SERVER.ps1
+- README/docs
+- BUILD_INFO.txt
+- SHA256SUMS.txt
+
+RUN PACKAGED RELEASE
+--------------------
+$env:VORTEX_API_KEY = "replace-with-a-strong-secret"
+
+.\dist\vortex-cuda-1.0.0-windows-x64\RUN_SERVER.ps1
+
+FINAL COMPLETION CRITERIA
+-------------------------
+Vortex CUDA 1.0.0 is complete when:
+
+1. BUILD_AND_TEST_M18.ps1 passes before commit.
+2. M18 is committed.
+3. Git is clean.
+4. Clean rebuild records VORTEX_GIT_DIRTY=0.
+5. BUILD_AND_TEST_M18.ps1 passes after commit.
+6. v1.0.0 tag exists.
+7. PACKAGE_M18_RELEASE.ps1 creates the release ZIP and SHA manifest.

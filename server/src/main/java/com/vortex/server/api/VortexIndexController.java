@@ -12,12 +12,15 @@ import com.vortex.server.service.VortexIndexService;
 
 import jakarta.validation.Valid;
 
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -28,6 +31,12 @@ import java.util.UUID;
 @RequestMapping("/api/v1/indexes")
 public final class VortexIndexController {
 
+    private static final String VECTOR_COUNT_HEADER =
+            "X-Vortex-Vector-Count";
+
+    private static final String DIMENSION_HEADER =
+            "X-Vortex-Dimension";
+
     private final VortexIndexService service;
 
     public VortexIndexController(
@@ -36,24 +45,47 @@ public final class VortexIndexController {
         this.service = service;
     }
 
-    @PostMapping
+    @PostMapping(
+            consumes =
+                    MediaType.APPLICATION_JSON_VALUE
+    )
     public ResponseEntity<CreateIndexResponse> create(
             @Valid
             @RequestBody
             CreateIndexRequest request
     ) {
-        CreateIndexResponse response =
-                service.create(request);
+        return created(
+                service.create(
+                        request
+                )
+        );
+    }
 
-        URI location =
-                URI.create(
-                        "/api/v1/indexes/" +
-                                response.index().id()
-                );
+    @PostMapping(
+            consumes =
+                    MediaType.APPLICATION_OCTET_STREAM_VALUE
+    )
+    public ResponseEntity<CreateIndexResponse> createBinary(
+            @RequestHeader(
+                    VECTOR_COUNT_HEADER
+            )
+            int vectorCount,
 
-        return ResponseEntity
-                .created(location)
-                .body(response);
+            @RequestHeader(
+                    DIMENSION_HEADER
+            )
+            int dimension,
+
+            @RequestBody
+            byte[] body
+    ) {
+        return created(
+                service.createBinary(
+                        vectorCount,
+                        dimension,
+                        body
+                )
+        );
     }
 
     @GetMapping
@@ -109,5 +141,20 @@ public final class VortexIndexController {
         return ResponseEntity
                 .noContent()
                 .build();
+    }
+
+    private static ResponseEntity<CreateIndexResponse> created(
+            CreateIndexResponse response
+    ) {
+        URI location =
+                URI.create(
+                        "/api/v1/indexes/" +
+                                response.index()
+                                        .id()
+                );
+
+        return ResponseEntity
+                .created(location)
+                .body(response);
     }
 }

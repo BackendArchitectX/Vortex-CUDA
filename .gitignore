@@ -69,3 +69,7 @@ java/build/
 # Maven build output
 java/target/
 server/target/
+dist/
+.env
+.env.*
+!.env.example

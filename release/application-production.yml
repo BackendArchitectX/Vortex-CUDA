@@ -1,0 +1,17 @@
+management:
+  endpoint:
+    health:
+      show-details: never
+
+vortex:
+  native:
+    fail-fast: true
+
+  security:
+    api-key: ${VORTEX_API_KEY:}
+
+  limits:
+    max-active-indexes: ${VORTEX_MAX_ACTIVE_INDEXES:8}
+    max-resident-vector-bytes: ${VORTEX_MAX_RESIDENT_VECTOR_BYTES:1610612736}
+    max-concurrent-searches: ${VORTEX_MAX_CONCURRENT_SEARCHES:2}
+    search-acquire-timeout-ms: ${VORTEX_SEARCH_ACQUIRE_TIMEOUT_MS:250}

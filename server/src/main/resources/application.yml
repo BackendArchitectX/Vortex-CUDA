@@ -7,6 +7,7 @@ spring:
 server:
   port: ${VORTEX_SERVER_PORT:8080}
   shutdown: graceful
+  forward-headers-strategy: framework
 
 management:
   endpoints:
@@ -15,7 +16,9 @@ management:
         include: health,info,metrics
   endpoint:
     health:
-      show-details: always
+      show-details: never
+      probes:
+        enabled: true
   info:
     env:
       enabled: true
@@ -23,11 +26,27 @@ management:
 info:
   app:
     name: Vortex CUDA
-    stage: M17
-    description: GPU-accelerated exact vector search REST service
+    version: 1.0.0
+    stage: M18
+    description: Production-hardened GPU-accelerated exact vector search service
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} level=%-5level thread=%thread requestId=%X{requestId:-} logger=%logger{36} msg=\"%msg\"%n"
 
 vortex:
+  native:
+    fail-fast: ${VORTEX_NATIVE_FAIL_FAST:true}
+
+  security:
+    api-key: ${VORTEX_API_KEY:}
+
   limits:
-    max-vector-count: ${VORTEX_MAX_VECTOR_COUNT:100000}
+    max-vector-count: ${VORTEX_MAX_VECTOR_COUNT:1000000}
     max-dimension: ${VORTEX_MAX_DIMENSION:4096}
-    max-index-elements: ${VORTEX_MAX_INDEX_ELEMENTS:2000000}
+    max-index-elements: ${VORTEX_MAX_INDEX_ELEMENTS:16000000}
+    max-active-indexes: ${VORTEX_MAX_ACTIVE_INDEXES:8}
+    max-resident-vector-bytes: ${VORTEX_MAX_RESIDENT_VECTOR_BYTES:1610612736}
+    max-concurrent-searches: ${VORTEX_MAX_CONCURRENT_SEARCHES:2}
+    search-acquire-timeout-ms: ${VORTEX_SEARCH_ACQUIRE_TIMEOUT_MS:250}
+    max-request-bytes: ${VORTEX_MAX_REQUEST_BYTES:134217728}

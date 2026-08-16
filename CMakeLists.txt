@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
         VortexCUDA
-        VERSION 0.3.0
+        VERSION 1.0.0
         LANGUAGES CXX CUDA
 )
 
@@ -128,6 +128,14 @@ set_target_properties(
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RUNTIME_LIBRARY Static
         OUTPUT_NAME "vortex_jni"
+)
+
+target_compile_definitions(
+        vortex_jni
+        PRIVATE
+        VORTEX_NATIVE_VERSION="${PROJECT_VERSION}"
+        VORTEX_GIT_COMMIT="${VORTEX_GIT_COMMIT}"
+        VORTEX_GIT_DIRTY=${VORTEX_GIT_DIRTY}
 )
 
 if (MSVC)

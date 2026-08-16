@@ -7,11 +7,25 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifndef VORTEX_NATIVE_VERSION
+#define VORTEX_NATIVE_VERSION "unknown"
+#endif
+
+#ifndef VORTEX_GIT_COMMIT
+#define VORTEX_GIT_COMMIT "unknown"
+#endif
+
+#ifndef VORTEX_GIT_DIRTY
+#define VORTEX_GIT_DIRTY 1
+#endif
 
 namespace
 {
@@ -411,9 +425,24 @@ Java_com_vortex_cuda_VortexNative_nativeVersion(
     JNIEnv* environment,
     jclass)
 {
+    std::ostringstream stream;
+
+    stream
+        << "Vortex CUDA JNI "
+        << VORTEX_NATIVE_VERSION
+        << " (commit "
+        << VORTEX_GIT_COMMIT
+        << ", "
+        << (
+            VORTEX_GIT_DIRTY
+                ? "dirty"
+                : "clean"
+        )
+        << ")";
+
     return
         environment->NewStringUTF(
-            "Vortex CUDA JNI M16"
+            stream.str().c_str()
         );
 }
 
@@ -937,6 +966,222 @@ Java_com_vortex_cuda_VortexNative_nativeFp16BuildTimeMs(
         );
 
         return 0.0;
+    }
+}
+
+
+JNIEXPORT jstring JNICALL
+Java_com_vortex_cuda_VortexNative_nativeDeviceName(
+    JNIEnv* environment,
+    jclass)
+{
+    try
+    {
+        int device = 0;
+        cudaDeviceProp properties{};
+
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(
+            cudaGetDeviceProperties(
+                &properties,
+                device
+            )
+        );
+
+        return environment->NewStringUTF(
+            properties.name
+        );
+    }
+    catch (const std::exception& exception)
+    {
+        throwIllegalState(
+            environment,
+            exception.what()
+        );
+
+        return nullptr;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_vortex_cuda_VortexNative_nativeComputeCapabilityMajor(
+    JNIEnv* environment,
+    jclass)
+{
+    try
+    {
+        int device = 0;
+        cudaDeviceProp properties{};
+
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(
+            cudaGetDeviceProperties(
+                &properties,
+                device
+            )
+        );
+
+        return static_cast<jint>(
+            properties.major
+        );
+    }
+    catch (const std::exception& exception)
+    {
+        throwIllegalState(
+            environment,
+            exception.what()
+        );
+        return 0;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_vortex_cuda_VortexNative_nativeComputeCapabilityMinor(
+    JNIEnv* environment,
+    jclass)
+{
+    try
+    {
+        int device = 0;
+        cudaDeviceProp properties{};
+
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(
+            cudaGetDeviceProperties(
+                &properties,
+                device
+            )
+        );
+
+        return static_cast<jint>(
+            properties.minor
+        );
+    }
+    catch (const std::exception& exception)
+    {
+        throwIllegalState(
+            environment,
+            exception.what()
+        );
+        return 0;
+    }
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_vortex_cuda_VortexNative_nativeCudaFreeMemoryBytes(
+    JNIEnv* environment,
+    jclass)
+{
+    try
+    {
+        std::size_t freeBytes = 0;
+        std::size_t totalBytes = 0;
+
+        CUDA_CHECK(
+            cudaMemGetInfo(
+                &freeBytes,
+                &totalBytes
+            )
+        );
+
+        return static_cast<jlong>(
+            freeBytes
+        );
+    }
+    catch (const std::exception& exception)
+    {
+        throwIllegalState(
+            environment,
+            exception.what()
+        );
+        return 0;
+    }
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_vortex_cuda_VortexNative_nativeCudaTotalMemoryBytes(
+    JNIEnv* environment,
+    jclass)
+{
+    try
+    {
+        std::size_t freeBytes = 0;
+        std::size_t totalBytes = 0;
+
+        CUDA_CHECK(
+            cudaMemGetInfo(
+                &freeBytes,
+                &totalBytes
+            )
+        );
+
+        return static_cast<jlong>(
+            totalBytes
+        );
+    }
+    catch (const std::exception& exception)
+    {
+        throwIllegalState(
+            environment,
+            exception.what()
+        );
+        return 0;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_vortex_cuda_VortexNative_nativeCudaRuntimeVersion(
+    JNIEnv* environment,
+    jclass)
+{
+    try
+    {
+        int version = 0;
+        CUDA_CHECK(
+            cudaRuntimeGetVersion(
+                &version
+            )
+        );
+
+        return static_cast<jint>(
+            version
+        );
+    }
+    catch (const std::exception& exception)
+    {
+        throwIllegalState(
+            environment,
+            exception.what()
+        );
+        return 0;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_vortex_cuda_VortexNative_nativeCudaDriverVersion(
+    JNIEnv* environment,
+    jclass)
+{
+    try
+    {
+        int version = 0;
+        CUDA_CHECK(
+            cudaDriverGetVersion(
+                &version
+            )
+        );
+
+        return static_cast<jint>(
+            version
+        );
+    }
+    catch (const std::exception& exception)
+    {
+        throwIllegalState(
+            environment,
+            exception.what()
+        );
+        return 0;
     }
 }
 

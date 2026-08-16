@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 
 #include "cuda_check.cuh"
 #include "gpu_vector_index.cuh"
@@ -931,6 +932,235 @@ void printFirstQueryNeighbors(
     }
 }
 
+
+// =========================================================
+// Milestone 9 focused Nsight Compute profiling mode
+//
+// Usage:
+//   vortex_cuda --profile-m8
+//               <vectorCount>
+//               <dimension>
+//               <topK>
+//               <batchSize>
+//
+// Warm-ups run before cudaProfilerStart(). With Nsight
+// Compute --profile-from-start off, only the measured region
+// is eligible for collection.
+// =========================================================
+
+int runM8ProfileMode(
+    const int argc,
+    char** argv)
+{
+    if (argc != 6)
+    {
+        std::cerr
+            << "Invalid profiling arguments.\n"
+            << "Usage: vortex_cuda --profile-m8 "
+            << "<vectorCount> <dimension> <topK> <batchSize>\n";
+
+        return EXIT_FAILURE;
+    }
+
+    const int vectorCount =
+        std::stoi(
+            argv[2]
+        );
+
+    const int dimension =
+        std::stoi(
+            argv[3]
+        );
+
+    const int topK =
+        std::stoi(
+            argv[4]
+        );
+
+    const int batchSize =
+        std::stoi(
+            argv[5]
+        );
+
+    if (vectorCount <= 0 ||
+        dimension <= 0 ||
+        topK <= 0 ||
+        topK > vectorCount ||
+        topK >
+            GpuVectorIndex::MAX_TOP_K ||
+        batchSize <= 0 ||
+        batchSize >
+            GpuVectorIndex::MAX_BATCH_SIZE)
+    {
+        std::cerr
+            << "Invalid profiling arguments.\n"
+            << "Constraints:\n"
+            << "  vectorCount > 0\n"
+            << "  dimension > 0\n"
+            << "  1 <= topK <= "
+            << GpuVectorIndex::MAX_TOP_K
+            << "\n"
+            << "  1 <= batchSize <= "
+            << GpuVectorIndex::MAX_BATCH_SIZE
+            << "\n";
+
+        return EXIT_FAILURE;
+    }
+
+    int deviceCount =
+        0;
+
+    CUDA_CHECK(
+        cudaGetDeviceCount(
+            &deviceCount
+        )
+    );
+
+    if (deviceCount == 0)
+    {
+        std::cerr
+            << "No CUDA GPU detected.\n";
+
+        return EXIT_FAILURE;
+    }
+
+    cudaDeviceProp device{};
+
+    CUDA_CHECK(
+        cudaGetDeviceProperties(
+            &device,
+            0
+        )
+    );
+
+    const std::size_t databaseElements =
+        static_cast<std::size_t>(
+            vectorCount
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    const std::size_t queryElements =
+        static_cast<std::size_t>(
+            batchSize
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    std::cout
+        << "============================================\n"
+        << "        Vortex CUDA M8 Profile Mode\n"
+        << "============================================\n\n"
+        << "GPU: "
+        << device.name
+        << '\n'
+        << "Dataset: "
+        << vectorCount
+        << " x "
+        << dimension
+        << '\n'
+        << "Top-K: "
+        << topK
+        << '\n'
+        << "Batch size: "
+        << batchSize
+        << '\n'
+        << "Warm-up runs: 3\n\n";
+
+    std::cout
+        << "Generating deterministic profile dataset...\n";
+
+    const std::vector<float> database =
+        generateRandomData(
+            databaseElements,
+            42
+        );
+
+    const std::vector<float> queries =
+        generateRandomData(
+            queryElements,
+            1337
+        );
+
+    std::cout
+        << "Building persistent GPU index...\n";
+
+    GpuVectorIndex gpuIndex(
+        database,
+        vectorCount,
+        dimension
+    );
+
+    constexpr int PROFILE_WARMUP_RUNS =
+        3;
+
+    std::cout
+        << "Running warm-ups outside profiler range...\n";
+
+    for (int run = 0;
+         run <
+             PROFILE_WARMUP_RUNS;
+         ++run)
+    {
+        (void)gpuIndex.searchTopKBatchTiled(
+            queries,
+            batchSize,
+            topK
+        );
+    }
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+
+    std::cout
+        << "Starting focused M8 profile region...\n";
+
+    CUDA_CHECK(
+        cudaProfilerStart()
+    );
+
+    const GpuBatchTopKResult result =
+        gpuIndex.searchTopKBatchTiled(
+            queries,
+            batchSize,
+            topK
+        );
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+
+    CUDA_CHECK(
+        cudaProfilerStop()
+    );
+
+    std::cout
+        << std::fixed
+        << std::setprecision(3)
+        << "\nFocused profile run completed.\n"
+        << "Query tile size:       "
+        << result.queryTileSize
+        << '\n'
+        << "Tiled kernel time:     "
+        << result.fusedKernelTimeMs
+        << " ms\n"
+        << "Candidate merge time:  "
+        << result.mergeKernelTimeMs
+        << " ms\n"
+        << "End-to-end time:       "
+        << result.totalTimeMs
+        << " ms\n"
+        << "Returned neighbors:    "
+        << result.neighbors.size()
+        << '\n';
+
+    return EXIT_SUCCESS;
+}
+
+
 // =========================================================
 // Main
 // =========================================================
@@ -941,6 +1171,18 @@ int main(
 {
     try
     {
+        if (argc >= 2 &&
+            std::string(
+                argv[1]
+            ) == "--profile-m8")
+        {
+            return
+                runM8ProfileMode(
+                    argc,
+                    argv
+                );
+        }
+
         int vectorCount =
             DEFAULT_VECTOR_COUNT;
 

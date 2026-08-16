@@ -56,19 +56,37 @@ struct GpuFusedTopKResult
 {
     std::vector<Neighbor> neighbors;
 
-    // Includes:
-    //   L2 distance computation
-    //   block-local Top-K selection
     float fusedKernelTimeMs = 0.0F;
-
-    // Additional hierarchical candidate merge stages.
     float mergeKernelTimeMs = 0.0F;
 
     double queryUploadTimeMs = 0.0;
     double resultDownloadTimeMs = 0.0;
     double totalTimeMs = 0.0;
 
-    // First fused local-selection stage + merge stages.
+    int topKPasses = 0;
+};
+
+struct GpuBatchTopKResult
+{
+    // Query-major:
+    //
+    // query 0:
+    //   neighbors[0 ... topK - 1]
+    //
+    // query 1:
+    //   neighbors[topK ... 2 * topK - 1]
+    std::vector<Neighbor> neighbors;
+
+    int queryCount = 0;
+    int topK = 0;
+
+    float fusedKernelTimeMs = 0.0F;
+    float mergeKernelTimeMs = 0.0F;
+
+    double queryUploadTimeMs = 0.0;
+    double resultDownloadTimeMs = 0.0;
+    double totalTimeMs = 0.0;
+
     int topKPasses = 0;
 };
 
@@ -76,6 +94,8 @@ class GpuVectorIndex
 {
 public:
     static constexpr int MAX_TOP_K = 32;
+
+    static constexpr int MAX_BATCH_SIZE = 32;
 
     static constexpr int
         FUSED_CANDIDATES_PER_BLOCK = 256;
@@ -116,12 +136,6 @@ public:
 
     // -----------------------------------------------------
     // Milestone 5 baseline
-    //
-    // Distance kernel
-    //      ->
-    // materialized N-distance array
-    //      ->
-    // hierarchical Top-K
     // -----------------------------------------------------
 
     [[nodiscard]]
@@ -132,19 +146,33 @@ public:
     );
 
     // -----------------------------------------------------
-    // Milestone 6 fused path
-    //
-    // Fused distance + block-local Top-K
-    //      ->
-    // hierarchical candidate merge
-    //
-    // Does NOT materialize N distances on the production
-    // fused search path.
+    // Milestone 6 optimized single-query path
     // -----------------------------------------------------
 
     [[nodiscard]]
     GpuFusedTopKResult searchTopKFused(
         const std::vector<float>& query,
+        int topK
+    );
+
+    // -----------------------------------------------------
+    // Milestone 7 batched fused path
+    //
+    // queries layout:
+    //
+    //   [Q0 dimensions...]
+    //   [Q1 dimensions...]
+    //   ...
+    //
+    // queries.size() must equal:
+    //
+    //   queryCount * dimension()
+    // -----------------------------------------------------
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatch(
+        const std::vector<float>& queries,
+        int queryCount,
         int topK
     );
 
@@ -160,6 +188,12 @@ public:
     );
 
     void warmUpFusedTopK(
+        int topK,
+        int iterations = 1
+    );
+
+    void warmUpTopKBatch(
+        int queryCount,
         int topK,
         int iterations = 1
     );
@@ -205,17 +239,25 @@ private:
     int dimension_;
 
     DeviceBuffer<float> deviceDatabase_;
-    DeviceBuffer<float> deviceQuery_;
 
-    // Retained for:
-    //   - full-distance reference search
-    //   - Milestone 5 baseline
-    //
-    // Milestone 6 fused search does not use this buffer.
+    // Single-query storage.
+    DeviceBuffer<float> deviceQuery_;
     DeviceBuffer<float> deviceDistances_;
 
     DeviceBuffer<Neighbor> deviceTopKBufferA_;
     DeviceBuffer<Neighbor> deviceTopKBufferB_;
+
+    // -----------------------------------------------------
+    // Milestone 7 persistent batch storage.
+    // -----------------------------------------------------
+
+    DeviceBuffer<float> deviceBatchQueries_;
+
+    DeviceBuffer<Neighbor>
+        deviceBatchTopKBufferA_;
+
+    DeviceBuffer<Neighbor>
+        deviceBatchTopKBufferB_;
 
     cudaEvent_t distanceStart_{};
     cudaEvent_t distanceStop_{};

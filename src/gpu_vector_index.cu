@@ -58,6 +58,28 @@ std::size_t ceilDivide(
         divisor;
 }
 
+std::size_t checkedMultiply(
+    const std::size_t left,
+    const std::size_t right,
+    const char* errorMessage)
+{
+    if (left != 0 &&
+        right >
+            std::numeric_limits<
+                std::size_t
+            >::max() /
+            left)
+    {
+        throw std::overflow_error(
+            errorMessage
+        );
+    }
+
+    return
+        left *
+        right;
+}
+
 std::size_t validateDatabase(
     const std::vector<float>& database,
     const int vectorCount,
@@ -75,20 +97,12 @@ std::size_t validateDatabase(
             "dimension"
         );
 
-    if (vectors >
-        std::numeric_limits<
-            std::size_t
-        >::max() /
-        dimensions)
-    {
-        throw std::overflow_error(
+    const std::size_t expectedElements =
+        checkedMultiply(
+            vectors,
+            dimensions,
             "Database dimensions overflow size_t."
         );
-    }
-
-    const std::size_t expectedElements =
-        vectors *
-        dimensions;
 
     if (database.size() !=
         expectedElements)
@@ -119,24 +133,64 @@ std::size_t calculateTopKBufferCapacity(
             )
         );
 
-    if (blockCount >
-        std::numeric_limits<
-            std::size_t
-        >::max() /
-        static_cast<std::size_t>(
-            GpuVectorIndex::MAX_TOP_K
-        ))
-    {
-        throw std::overflow_error(
+    return
+        checkedMultiply(
+            blockCount,
+            static_cast<std::size_t>(
+                GpuVectorIndex::MAX_TOP_K
+            ),
             "Top-K intermediate buffer size overflow."
         );
-    }
+}
+
+std::size_t calculateBatchTopKBufferCapacity(
+    const int vectorCount)
+{
+    const std::size_t perQueryCapacity =
+        calculateTopKBufferCapacity(
+            vectorCount
+        );
 
     return
-        blockCount *
-        static_cast<std::size_t>(
-            GpuVectorIndex::MAX_TOP_K
+        checkedMultiply(
+            perQueryCapacity,
+            static_cast<std::size_t>(
+                GpuVectorIndex::MAX_BATCH_SIZE
+            ),
+            "Batch Top-K buffer size overflow."
         );
+}
+
+std::size_t calculateBatchQueryCapacity(
+    const int dimension)
+{
+    return
+        checkedMultiply(
+            requirePositive(
+                dimension,
+                "dimension"
+            ),
+            static_cast<std::size_t>(
+                GpuVectorIndex::MAX_BATCH_SIZE
+            ),
+            "Batch query buffer size overflow."
+        );
+}
+
+void validateTopK(
+    const int topK,
+    const int vectorCount)
+{
+    if (topK <= 0 ||
+        topK >
+            GpuVectorIndex::MAX_TOP_K ||
+        topK > vectorCount)
+    {
+        throw std::invalid_argument(
+            "topK must be between 1 and "
+            "min(vectorCount, 32)."
+        );
+    }
 }
 
 } // namespace
@@ -169,7 +223,7 @@ float warpReduceSum(
 }
 
 // =========================================================
-// Shared-memory distance kernel
+// Distance kernels
 // =========================================================
 
 template <int BLOCK_SIZE>
@@ -264,10 +318,6 @@ __global__ void l2DistanceSharedKernel(
             partial[0];
     }
 }
-
-// =========================================================
-// Warp-shuffle distance kernel
-// =========================================================
 
 template <int BLOCK_SIZE>
 __global__ void l2DistanceWarpKernel(
@@ -389,7 +439,6 @@ Neighbor makeInvalidNeighbor()
 {
     Neighbor neighbor;
 
-    // +infinity
     neighbor.distance =
         __int_as_float(
             0x7F800000
@@ -496,9 +545,7 @@ __device__ void bitonicSortNeighbors(
 }
 
 // =========================================================
-// Milestone 5 stage 1
-//
-// Full distance array -> local Top-K candidates.
+// Milestone 5 first-stage Top-K
 // =========================================================
 
 __global__ void topKFromDistancesKernel(
@@ -583,7 +630,7 @@ __global__ void topKFromDistancesKernel(
 }
 
 // =========================================================
-// Candidate merge stage
+// Single-query candidate merge
 // =========================================================
 
 __global__ void topKFromCandidatesKernel(
@@ -663,24 +710,7 @@ __global__ void topKFromCandidatesKernel(
 }
 
 // =========================================================
-// Milestone 6 fused kernel
-//
-// One 256-thread block processes 256 vectors.
-//
-// There are 8 warps in the block.
-//
-// Each warp processes 32 vectors sequentially:
-//
-//   8 warps * 32 vectors = 256 vectors/block
-//
-// A warp cooperatively calculates the L2 distance for one
-// vector, then lane 0 stores that vector's candidate into
-// shared memory.
-//
-// After all 256 vectors are processed, the same block
-// performs local Top-K selection.
-//
-// No N-sized global distance array is written.
+// Milestone 6 fused single-query kernel
 // =========================================================
 
 __global__ void fusedDistanceLocalTopKKernel(
@@ -694,10 +724,6 @@ __global__ void fusedDistanceLocalTopKKernel(
     constexpr int WARPS_PER_BLOCK =
         TOPK_BLOCK_SIZE /
         CUDA_WARP_SIZE;
-
-    static_assert(
-        WARPS_PER_BLOCK == 8
-    );
 
     __shared__ Neighbor candidates[
         FUSED_GROUP_SIZE
@@ -716,13 +742,6 @@ __global__ void fusedDistanceLocalTopKKernel(
         threadId /
         CUDA_WARP_SIZE;
 
-    // -----------------------------------------------------
-    // Initialize every shared-memory candidate first.
-    //
-    // The barrier is important because a different warp's
-    // lane zero may later overwrite the same shared slot.
-    // -----------------------------------------------------
-
     candidates[
         threadId
     ] =
@@ -737,15 +756,6 @@ __global__ void fusedDistanceLocalTopKKernel(
         static_cast<std::size_t>(
             FUSED_GROUP_SIZE
         );
-
-    // -----------------------------------------------------
-    // Each warp owns local candidate positions:
-    //
-    // warp 0 -> 0, 8, 16, ...
-    // warp 1 -> 1, 9, 17, ...
-    // ...
-    // warp 7 -> 7, 15, 23, ...
-    // -----------------------------------------------------
 
     for (int localVectorIndex =
              warpId;
@@ -774,13 +784,6 @@ __global__ void fusedDistanceLocalTopKKernel(
                     dimension
                 );
 
-            // ---------------------------------------------
-            // One warp cooperatively evaluates one vector.
-            //
-            // For dimension 128:
-            // each lane processes four values.
-            // ---------------------------------------------
-
             for (int dimensionIndex =
                      laneId;
                  dimensionIndex <
@@ -802,7 +805,6 @@ __global__ void fusedDistanceLocalTopKKernel(
             }
         }
 
-        // Every lane participates.
         localSum =
             warpReduceSum(
                 localSum
@@ -826,12 +828,7 @@ __global__ void fusedDistanceLocalTopKKernel(
         }
     }
 
-    // Every candidate must be complete before sorting.
     __syncthreads();
-
-    // -----------------------------------------------------
-    // Local exact Top-K over 256 vector candidates.
-    // -----------------------------------------------------
 
     bitonicSortNeighbors<
         TOPK_BLOCK_SIZE
@@ -863,7 +860,279 @@ __global__ void fusedDistanceLocalTopKKernel(
 }
 
 // =========================================================
-// Host-side launch helpers
+// Milestone 7 fused batch kernel
+//
+// blockIdx.x -> vector partition
+// blockIdx.y -> query
+//
+// Each block evaluates 256 database vectors against one
+// query and emits block-local Top-K candidates.
+// =========================================================
+
+__global__ void fusedDistanceLocalTopKBatchKernel(
+    const float* __restrict__ database,
+    const float* __restrict__ queries,
+    Neighbor* __restrict__ output,
+    const int vectorCount,
+    const int dimension,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery)
+{
+    constexpr int WARPS_PER_BLOCK =
+        TOPK_BLOCK_SIZE /
+        CUDA_WARP_SIZE;
+
+    __shared__ Neighbor candidates[
+        FUSED_GROUP_SIZE
+    ];
+
+    const int threadId =
+        static_cast<int>(
+            threadIdx.x
+        );
+
+    const int laneId =
+        threadId &
+        (CUDA_WARP_SIZE - 1);
+
+    const int warpId =
+        threadId /
+        CUDA_WARP_SIZE;
+
+    const int queryIndex =
+        static_cast<int>(
+            blockIdx.y
+        );
+
+    const float* query =
+        queries +
+        static_cast<std::size_t>(
+            queryIndex
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    candidates[
+        threadId
+    ] =
+        makeInvalidNeighbor();
+
+    __syncthreads();
+
+    const std::size_t blockVectorBase =
+        static_cast<std::size_t>(
+            blockIdx.x
+        ) *
+        static_cast<std::size_t>(
+            FUSED_GROUP_SIZE
+        );
+
+    for (int localVectorIndex =
+             warpId;
+         localVectorIndex <
+             FUSED_GROUP_SIZE;
+         localVectorIndex +=
+             WARPS_PER_BLOCK)
+    {
+        const std::size_t vectorIndex =
+            blockVectorBase +
+            static_cast<std::size_t>(
+                localVectorIndex
+            );
+
+        float localSum = 0.0F;
+
+        if (vectorIndex <
+            static_cast<std::size_t>(
+                vectorCount
+            ))
+        {
+            const float* vector =
+                database +
+                vectorIndex *
+                static_cast<std::size_t>(
+                    dimension
+                );
+
+            for (int dimensionIndex =
+                     laneId;
+                 dimensionIndex <
+                     dimension;
+                 dimensionIndex +=
+                     CUDA_WARP_SIZE)
+            {
+                const float difference =
+                    vector[
+                        dimensionIndex
+                    ] -
+                    query[
+                        dimensionIndex
+                    ];
+
+                localSum +=
+                    difference *
+                    difference;
+            }
+        }
+
+        localSum =
+            warpReduceSum(
+                localSum
+            );
+
+        if (laneId == 0 &&
+            vectorIndex <
+                static_cast<std::size_t>(
+                    vectorCount
+                ))
+        {
+            candidates[
+                localVectorIndex
+            ] =
+                Neighbor{
+                    static_cast<int>(
+                        vectorIndex
+                    ),
+                    localSum
+                };
+        }
+    }
+
+    __syncthreads();
+
+    bitonicSortNeighbors<
+        TOPK_BLOCK_SIZE
+    >(
+        candidates
+    );
+
+    if (threadId <
+        topK)
+    {
+        const std::size_t queryOffset =
+            static_cast<std::size_t>(
+                queryIndex
+            ) *
+            candidateCapacityPerQuery;
+
+        const std::size_t outputIndex =
+            queryOffset +
+            static_cast<std::size_t>(
+                blockIdx.x
+            ) *
+            static_cast<std::size_t>(
+                topK
+            ) +
+            static_cast<std::size_t>(
+                threadId
+            );
+
+        output[
+            outputIndex
+        ] =
+            candidates[
+                threadId
+            ];
+    }
+}
+
+// =========================================================
+// Milestone 7 batched candidate merge
+// =========================================================
+
+__global__ void topKFromCandidatesBatchKernel(
+    const Neighbor* __restrict__ input,
+    Neighbor* __restrict__ output,
+    const int countPerQuery,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery)
+{
+    __shared__ Neighbor candidates[
+        TOPK_BLOCK_SIZE
+    ];
+
+    const int threadId =
+        static_cast<int>(
+            threadIdx.x
+        );
+
+    const int queryIndex =
+        static_cast<int>(
+            blockIdx.y
+        );
+
+    const std::size_t queryOffset =
+        static_cast<std::size_t>(
+            queryIndex
+        ) *
+        candidateCapacityPerQuery;
+
+    const std::size_t localIndex =
+        static_cast<std::size_t>(
+            blockIdx.x
+        ) *
+        static_cast<std::size_t>(
+            TOPK_BLOCK_SIZE
+        ) +
+        static_cast<std::size_t>(
+            threadId
+        );
+
+    Neighbor candidate =
+        makeInvalidNeighbor();
+
+    if (localIndex <
+        static_cast<std::size_t>(
+            countPerQuery
+        ))
+    {
+        candidate =
+            input[
+                queryOffset +
+                localIndex
+            ];
+    }
+
+    candidates[
+        threadId
+    ] =
+        candidate;
+
+    __syncthreads();
+
+    bitonicSortNeighbors<
+        TOPK_BLOCK_SIZE
+    >(
+        candidates
+    );
+
+    if (threadId <
+        topK)
+    {
+        const std::size_t outputIndex =
+            queryOffset +
+            static_cast<std::size_t>(
+                blockIdx.x
+            ) *
+            static_cast<std::size_t>(
+                topK
+            ) +
+            static_cast<std::size_t>(
+                threadId
+            );
+
+        output[
+            outputIndex
+        ] =
+            candidates[
+                threadId
+            ];
+    }
+}
+
+// =========================================================
+// Host launch helpers
 // =========================================================
 
 namespace
@@ -1121,6 +1390,93 @@ CandidateMergeResult mergeTopKCandidates(
     return result;
 }
 
+struct BatchCandidateMergeResult
+{
+    Neighbor* finalBuffer = nullptr;
+    int mergePasses = 0;
+};
+
+BatchCandidateMergeResult
+mergeTopKCandidatesBatch(
+    Neighbor* currentBuffer,
+    Neighbor* nextBuffer,
+    std::size_t currentCountPerQuery,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery)
+{
+    BatchCandidateMergeResult result;
+
+    while (currentCountPerQuery >
+           static_cast<std::size_t>(
+               topK
+           ))
+    {
+        if (currentCountPerQuery >
+            static_cast<std::size_t>(
+                INT_MAX
+            ))
+        {
+            throw std::overflow_error(
+                "Batch candidate count exceeds int range."
+            );
+        }
+
+        const std::size_t blockCount =
+            ceilDivide(
+                currentCountPerQuery,
+                static_cast<std::size_t>(
+                    TOPK_BLOCK_SIZE
+                )
+            );
+
+        const dim3 grid(
+            static_cast<unsigned int>(
+                blockCount
+            ),
+            static_cast<unsigned int>(
+                queryCount
+            ),
+            1U
+        );
+
+        topKFromCandidatesBatchKernel<<<
+            grid,
+            TOPK_BLOCK_SIZE
+        >>>(
+            currentBuffer,
+            nextBuffer,
+            static_cast<int>(
+                currentCountPerQuery
+            ),
+            topK,
+            candidateCapacityPerQuery
+        );
+
+        CUDA_CHECK(
+            cudaGetLastError()
+        );
+
+        currentCountPerQuery =
+            blockCount *
+            static_cast<std::size_t>(
+                topK
+            );
+
+        std::swap(
+            currentBuffer,
+            nextBuffer
+        );
+
+        ++result.mergePasses;
+    }
+
+    result.finalBuffer =
+        currentBuffer;
+
+    return result;
+}
+
 } // namespace
 
 // =========================================================
@@ -1163,6 +1519,21 @@ GpuVectorIndex::GpuVectorIndex(
     ),
       deviceTopKBufferB_(
         calculateTopKBufferCapacity(
+            vectorCount
+        )
+    ),
+      deviceBatchQueries_(
+        calculateBatchQueryCapacity(
+            dimension
+        )
+    ),
+      deviceBatchTopKBufferA_(
+        calculateBatchTopKBufferCapacity(
+            vectorCount
+        )
+    ),
+      deviceBatchTopKBufferB_(
+        calculateBatchTopKBufferCapacity(
             vectorCount
         )
     )
@@ -1422,7 +1793,7 @@ GpuSearchResult GpuVectorIndex::search(
 }
 
 // =========================================================
-// Milestone 5 baseline Top-K
+// Milestone 5 baseline
 // =========================================================
 
 GpuTopKResult GpuVectorIndex::searchTopK(
@@ -1450,15 +1821,10 @@ GpuTopKResult GpuVectorIndex::searchTopK(
         );
     }
 
-    if (topK <= 0 ||
-        topK > MAX_TOP_K ||
-        topK > vectorCount_)
-    {
-        throw std::invalid_argument(
-            "topK must be between 1 and "
-            "min(vectorCount, 32)."
-        );
-    }
+    validateTopK(
+        topK,
+        vectorCount_
+    );
 
     const auto totalStart =
         std::chrono::steady_clock::now();
@@ -1470,10 +1836,6 @@ GpuTopKResult GpuVectorIndex::searchTopK(
             topK
         )
     );
-
-    // -----------------------------------------------------
-    // Query upload
-    // -----------------------------------------------------
 
     const auto uploadStart =
         std::chrono::steady_clock::now();
@@ -1502,10 +1864,6 @@ GpuTopKResult GpuVectorIndex::searchTopK(
             uploadStart
         ).count();
 
-    // -----------------------------------------------------
-    // Full distance kernel
-    // -----------------------------------------------------
-
     CUDA_CHECK(
         cudaEventRecord(
             distanceStart_
@@ -1530,10 +1888,6 @@ GpuTopKResult GpuVectorIndex::searchTopK(
             distanceStop_
         )
     );
-
-    // -----------------------------------------------------
-    // Top-K first stage
-    // -----------------------------------------------------
 
     CUDA_CHECK(
         cudaEventRecord(
@@ -1567,17 +1921,14 @@ GpuTopKResult GpuVectorIndex::searchTopK(
         cudaGetLastError()
     );
 
-    const std::size_t firstCandidateCount =
-        firstBlockCount *
-        static_cast<std::size_t>(
-            topK
-        );
-
     const CandidateMergeResult merge =
         mergeTopKCandidates(
             deviceTopKBufferA_.data(),
             deviceTopKBufferB_.data(),
-            firstCandidateCount,
+            firstBlockCount *
+                static_cast<std::size_t>(
+                    topK
+                ),
             topK
         );
 
@@ -1612,10 +1963,6 @@ GpuTopKResult GpuVectorIndex::searchTopK(
             topKStop_
         )
     );
-
-    // -----------------------------------------------------
-    // Download only K candidates
-    // -----------------------------------------------------
 
     const auto downloadStart =
         std::chrono::steady_clock::now();
@@ -1660,7 +2007,7 @@ GpuTopKResult GpuVectorIndex::searchTopK(
 }
 
 // =========================================================
-// Milestone 6 fused search
+// Milestone 6 single-query fused search
 // =========================================================
 
 GpuFusedTopKResult
@@ -1679,15 +2026,10 @@ GpuVectorIndex::searchTopKFused(
         );
     }
 
-    if (topK <= 0 ||
-        topK > MAX_TOP_K ||
-        topK > vectorCount_)
-    {
-        throw std::invalid_argument(
-            "topK must be between 1 and "
-            "min(vectorCount, 32)."
-        );
-    }
+    validateTopK(
+        topK,
+        vectorCount_
+    );
 
     const auto totalStart =
         std::chrono::steady_clock::now();
@@ -1699,10 +2041,6 @@ GpuVectorIndex::searchTopKFused(
             topK
         )
     );
-
-    // -----------------------------------------------------
-    // Query upload
-    // -----------------------------------------------------
 
     const auto uploadStart =
         std::chrono::steady_clock::now();
@@ -1730,10 +2068,6 @@ GpuVectorIndex::searchTopKFused(
             uploadEnd -
             uploadStart
         ).count();
-
-    // -----------------------------------------------------
-    // Fused distance + local Top-K
-    // -----------------------------------------------------
 
     const std::size_t firstBlockCount =
         ceilDivide(
@@ -1775,27 +2109,20 @@ GpuVectorIndex::searchTopKFused(
         )
     );
 
-    // -----------------------------------------------------
-    // Hierarchical candidate-only merge
-    // -----------------------------------------------------
-
     CUDA_CHECK(
         cudaEventRecord(
             topKStart_
         )
     );
 
-    const std::size_t firstCandidateCount =
-        firstBlockCount *
-        static_cast<std::size_t>(
-            topK
-        );
-
     const CandidateMergeResult merge =
         mergeTopKCandidates(
             deviceTopKBufferA_.data(),
             deviceTopKBufferB_.data(),
-            firstCandidateCount,
+            firstBlockCount *
+                static_cast<std::size_t>(
+                    topK
+                ),
             topK
         );
 
@@ -1830,10 +2157,6 @@ GpuVectorIndex::searchTopKFused(
             topKStop_
         )
     );
-
-    // -----------------------------------------------------
-    // Download only K neighbors
-    // -----------------------------------------------------
 
     const auto downloadStart =
         std::chrono::steady_clock::now();
@@ -1878,7 +2201,283 @@ GpuVectorIndex::searchTopKFused(
 }
 
 // =========================================================
-// Full-distance warm-up
+// Milestone 7 batch search
+// =========================================================
+
+GpuBatchTopKResult
+GpuVectorIndex::searchTopKBatch(
+    const std::vector<float>& queries,
+    const int queryCount,
+    const int topK)
+{
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between "
+            "1 and 32."
+        );
+    }
+
+    validateTopK(
+        topK,
+        vectorCount_
+    );
+
+    const std::size_t expectedElements =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                dimension_
+            ),
+            "Batch query dimensions overflow size_t."
+        );
+
+    if (queries.size() !=
+        expectedElements)
+    {
+        throw std::invalid_argument(
+            "queries.size() must equal "
+            "queryCount * dimension."
+        );
+    }
+
+    const auto totalStart =
+        std::chrono::steady_clock::now();
+
+    GpuBatchTopKResult result;
+
+    result.queryCount =
+        queryCount;
+
+    result.topK =
+        topK;
+
+    result.neighbors.resize(
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            topK
+        )
+    );
+
+    // -----------------------------------------------------
+    // Upload all queries in one transfer.
+    // -----------------------------------------------------
+
+    const auto uploadStart =
+        std::chrono::steady_clock::now();
+
+    CUDA_CHECK(
+        cudaMemcpy(
+            deviceBatchQueries_.data(),
+            queries.data(),
+            expectedElements *
+                sizeof(float),
+            cudaMemcpyHostToDevice
+        )
+    );
+
+    const auto uploadEnd =
+        std::chrono::steady_clock::now();
+
+    result.queryUploadTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            uploadEnd -
+            uploadStart
+        ).count();
+
+    const std::size_t firstBlockCount =
+        ceilDivide(
+            static_cast<std::size_t>(
+                vectorCount_
+            ),
+            static_cast<std::size_t>(
+                FUSED_GROUP_SIZE
+            )
+        );
+
+    const std::size_t
+        candidateCapacityPerQuery =
+            calculateTopKBufferCapacity(
+                vectorCount_
+            );
+
+    // -----------------------------------------------------
+    // 2D fused search:
+    //
+    // x = database partition
+    // y = query
+    // -----------------------------------------------------
+
+    const dim3 fusedGrid(
+        static_cast<unsigned int>(
+            firstBlockCount
+        ),
+        static_cast<unsigned int>(
+            queryCount
+        ),
+        1U
+    );
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            distanceStart_
+        )
+    );
+
+    fusedDistanceLocalTopKBatchKernel<<<
+        fusedGrid,
+        TOPK_BLOCK_SIZE
+    >>>(
+        deviceDatabase_.data(),
+        deviceBatchQueries_.data(),
+        deviceBatchTopKBufferA_.data(),
+        vectorCount_,
+        dimension_,
+        topK,
+        candidateCapacityPerQuery
+    );
+
+    CUDA_CHECK(
+        cudaGetLastError()
+    );
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            distanceStop_
+        )
+    );
+
+    // -----------------------------------------------------
+    // Per-query hierarchical merge.
+    // -----------------------------------------------------
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            topKStart_
+        )
+    );
+
+    const std::size_t
+        firstCandidateCountPerQuery =
+            firstBlockCount *
+            static_cast<std::size_t>(
+                topK
+            );
+
+    const BatchCandidateMergeResult merge =
+        mergeTopKCandidatesBatch(
+            deviceBatchTopKBufferA_.data(),
+            deviceBatchTopKBufferB_.data(),
+            firstCandidateCountPerQuery,
+            queryCount,
+            topK,
+            candidateCapacityPerQuery
+        );
+
+    result.topKPasses =
+        1 +
+        merge.mergePasses;
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            topKStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventSynchronize(
+            topKStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventElapsedTime(
+            &result.fusedKernelTimeMs,
+            distanceStart_,
+            distanceStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventElapsedTime(
+            &result.mergeKernelTimeMs,
+            topKStart_,
+            topKStop_
+        )
+    );
+
+    // -----------------------------------------------------
+    // Each query occupies a fixed candidate segment on GPU.
+    //
+    // cudaMemcpy2D gathers only the first K neighbors from
+    // each segment into one contiguous host result vector.
+    // -----------------------------------------------------
+
+    const auto downloadStart =
+        std::chrono::steady_clock::now();
+
+    const std::size_t copyWidth =
+        static_cast<std::size_t>(
+            topK
+        ) *
+        sizeof(Neighbor);
+
+    const std::size_t sourcePitch =
+        candidateCapacityPerQuery *
+        sizeof(Neighbor);
+
+    CUDA_CHECK(
+        cudaMemcpy2D(
+            result.neighbors.data(),
+            copyWidth,
+            merge.finalBuffer,
+            sourcePitch,
+            copyWidth,
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            cudaMemcpyDeviceToHost
+        )
+    );
+
+    const auto downloadEnd =
+        std::chrono::steady_clock::now();
+
+    result.resultDownloadTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            downloadEnd -
+            downloadStart
+        ).count();
+
+    const auto totalEnd =
+        std::chrono::steady_clock::now();
+
+    result.totalTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            totalEnd -
+            totalStart
+        ).count();
+
+    return result;
+}
+
+// =========================================================
+// Warm-up methods
 // =========================================================
 
 void GpuVectorIndex::warmUp(
@@ -1913,10 +2512,6 @@ void GpuVectorIndex::warmUp(
         cudaDeviceSynchronize()
     );
 }
-
-// =========================================================
-// Baseline Top-K warm-up
-// =========================================================
 
 void GpuVectorIndex::warmUpTopK(
     const GpuSearchConfig& config,
@@ -1953,10 +2548,6 @@ void GpuVectorIndex::warmUpTopK(
     );
 }
 
-// =========================================================
-// Fused Top-K warm-up
-// =========================================================
-
 void GpuVectorIndex::warmUpFusedTopK(
     const int topK,
     const int iterations)
@@ -1981,6 +2572,54 @@ void GpuVectorIndex::warmUpFusedTopK(
     {
         (void)searchTopKFused(
             query,
+            topK
+        );
+    }
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+}
+
+void GpuVectorIndex::warmUpTopKBatch(
+    const int queryCount,
+    const int topK,
+    const int iterations)
+{
+    if (iterations <= 0)
+    {
+        throw std::invalid_argument(
+            "Warm-up iterations must be positive."
+        );
+    }
+
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between "
+            "1 and 32."
+        );
+    }
+
+    std::vector<float> queries(
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            dimension_
+        ),
+        0.0F
+    );
+
+    for (int iteration = 0;
+         iteration < iterations;
+         ++iteration)
+    {
+        (void)searchTopKBatch(
+            queries,
+            queryCount,
             topK
         );
     }

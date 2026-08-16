@@ -1037,6 +1037,420 @@ __global__ void fusedDistanceLocalTopKBatchKernel(
     }
 }
 
+
+// =========================================================
+// Milestone 8 query-tiled fused batch kernel
+//
+// A block evaluates one 256-vector partition against a
+// compile-time query tile.
+//
+// Database values are loaded once and reused across every
+// query in the tile.
+//
+// Supported query-tile sizes:
+//   1
+//   2
+//   4
+//
+// For QUERY_TILE_SIZE = 4:
+//
+//   blockIdx.x -> vector partition
+//   blockIdx.y -> group of four queries
+//
+// The 256 block threads are also partitioned into four
+// 64-thread cooperative sorting groups, allowing the four
+// local 256-candidate Top-K sorts to progress concurrently.
+// =========================================================
+
+template <int QUERY_TILE_SIZE>
+__global__ void queryTiledDistanceLocalTopKBatchKernel(
+    const float* __restrict__ database,
+    const float* __restrict__ queries,
+    Neighbor* __restrict__ output,
+    const int vectorCount,
+    const int dimension,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery)
+{
+    constexpr int WARPS_PER_BLOCK =
+        TOPK_BLOCK_SIZE /
+        CUDA_WARP_SIZE;
+
+    static_assert(
+        QUERY_TILE_SIZE == 1 ||
+        QUERY_TILE_SIZE == 2 ||
+        QUERY_TILE_SIZE == 4
+    );
+
+    static_assert(
+        TOPK_BLOCK_SIZE %
+        QUERY_TILE_SIZE == 0
+    );
+
+    constexpr int SORT_THREADS_PER_QUERY =
+        TOPK_BLOCK_SIZE /
+        QUERY_TILE_SIZE;
+
+    static_assert(
+        GpuVectorIndex::MAX_TOP_K <=
+        SORT_THREADS_PER_QUERY
+    );
+
+    __shared__ Neighbor candidates[
+        QUERY_TILE_SIZE *
+        FUSED_GROUP_SIZE
+    ];
+
+    const int threadId =
+        static_cast<int>(
+            threadIdx.x
+        );
+
+    const int laneId =
+        threadId &
+        (CUDA_WARP_SIZE - 1);
+
+    const int warpId =
+        threadId /
+        CUDA_WARP_SIZE;
+
+    const int queryBase =
+        static_cast<int>(
+            blockIdx.y
+        ) *
+        QUERY_TILE_SIZE;
+
+    int activeQueries =
+        queryCount -
+        queryBase;
+
+    if (activeQueries >
+        QUERY_TILE_SIZE)
+    {
+        activeQueries =
+            QUERY_TILE_SIZE;
+    }
+
+    // -----------------------------------------------------
+    // Initialize every query-local candidate array.
+    // -----------------------------------------------------
+
+    for (int candidateIndex =
+             threadId;
+         candidateIndex <
+             QUERY_TILE_SIZE *
+             FUSED_GROUP_SIZE;
+         candidateIndex +=
+             TOPK_BLOCK_SIZE)
+    {
+        candidates[
+            candidateIndex
+        ] =
+            makeInvalidNeighbor();
+    }
+
+    __syncthreads();
+
+    const std::size_t blockVectorBase =
+        static_cast<std::size_t>(
+            blockIdx.x
+        ) *
+        static_cast<std::size_t>(
+            FUSED_GROUP_SIZE
+        );
+
+    // -----------------------------------------------------
+    // Eight warps cooperate on 256 vectors.
+    //
+    // For every vector component we load the database value
+    // once, then reuse it across all active queries.
+    // -----------------------------------------------------
+
+    for (int localVectorIndex =
+             warpId;
+         localVectorIndex <
+             FUSED_GROUP_SIZE;
+         localVectorIndex +=
+             WARPS_PER_BLOCK)
+    {
+        const std::size_t vectorIndex =
+            blockVectorBase +
+            static_cast<std::size_t>(
+                localVectorIndex
+            );
+
+        float localSums[
+            QUERY_TILE_SIZE
+        ];
+
+        #pragma unroll
+        for (int querySlot = 0;
+             querySlot <
+                 QUERY_TILE_SIZE;
+             ++querySlot)
+        {
+            localSums[
+                querySlot
+            ] =
+                0.0F;
+        }
+
+        if (vectorIndex <
+            static_cast<std::size_t>(
+                vectorCount
+            ))
+        {
+            const float* vector =
+                database +
+                vectorIndex *
+                static_cast<std::size_t>(
+                    dimension
+                );
+
+            for (int dimensionIndex =
+                     laneId;
+                 dimensionIndex <
+                     dimension;
+                 dimensionIndex +=
+                     CUDA_WARP_SIZE)
+            {
+                const float vectorValue =
+                    vector[
+                        dimensionIndex
+                    ];
+
+                #pragma unroll
+                for (int querySlot = 0;
+                     querySlot <
+                         QUERY_TILE_SIZE;
+                     ++querySlot)
+                {
+                    if (querySlot <
+                        activeQueries)
+                    {
+                        const int queryIndex =
+                            queryBase +
+                            querySlot;
+
+                        const float queryValue =
+                            queries[
+                                static_cast<
+                                    std::size_t
+                                >(
+                                    queryIndex
+                                ) *
+                                static_cast<
+                                    std::size_t
+                                >(
+                                    dimension
+                                ) +
+                                static_cast<
+                                    std::size_t
+                                >(
+                                    dimensionIndex
+                                )
+                            ];
+
+                        const float difference =
+                            vectorValue -
+                            queryValue;
+
+                        localSums[
+                            querySlot
+                        ] +=
+                            difference *
+                            difference;
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int querySlot = 0;
+             querySlot <
+                 QUERY_TILE_SIZE;
+             ++querySlot)
+        {
+            const float distance =
+                warpReduceSum(
+                    localSums[
+                        querySlot
+                    ]
+                );
+
+            if (laneId == 0 &&
+                querySlot <
+                    activeQueries &&
+                vectorIndex <
+                    static_cast<
+                        std::size_t
+                    >(
+                        vectorCount
+                    ))
+            {
+                candidates[
+                    querySlot *
+                    FUSED_GROUP_SIZE +
+                    localVectorIndex
+                ] =
+                    Neighbor{
+                        static_cast<int>(
+                            vectorIndex
+                        ),
+                        distance
+                    };
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // -----------------------------------------------------
+    // Sort all query-local candidate arrays concurrently.
+    //
+    // QUERY_TILE_SIZE = 4:
+    //   64 threads/query
+    //
+    // Each sorting thread owns multiple candidate indices.
+    // Every block thread reaches every synchronization point.
+    // -----------------------------------------------------
+
+    const int sortQuerySlot =
+        threadId /
+        SORT_THREADS_PER_QUERY;
+
+    const int sortThreadId =
+        threadId %
+        SORT_THREADS_PER_QUERY;
+
+    Neighbor* sortValues =
+        candidates +
+        sortQuerySlot *
+        FUSED_GROUP_SIZE;
+
+    for (unsigned int sequenceSize = 2;
+         sequenceSize <=
+             TOPK_BLOCK_SIZE;
+         sequenceSize <<= 1)
+    {
+        for (unsigned int stride =
+                 sequenceSize >> 1;
+             stride > 0;
+             stride >>= 1)
+        {
+            for (int candidateIndex =
+                     sortThreadId;
+                 candidateIndex <
+                     TOPK_BLOCK_SIZE;
+                 candidateIndex +=
+                     SORT_THREADS_PER_QUERY)
+            {
+                const unsigned int partner =
+                    static_cast<
+                        unsigned int
+                    >(
+                        candidateIndex
+                    ) ^
+                    stride;
+
+                if (partner >
+                    static_cast<
+                        unsigned int
+                    >(
+                        candidateIndex
+                    ))
+                {
+                    const bool ascending =
+                        (
+                            static_cast<
+                                unsigned int
+                            >(
+                                candidateIndex
+                            ) &
+                            sequenceSize
+                        ) == 0;
+
+                    const Neighbor left =
+                        sortValues[
+                            candidateIndex
+                        ];
+
+                    const Neighbor right =
+                        sortValues[
+                            partner
+                        ];
+
+                    const bool shouldSwap =
+                        ascending
+                            ? neighborLess(
+                                right,
+                                left
+                            )
+                            : neighborLess(
+                                left,
+                                right
+                            );
+
+                    if (shouldSwap)
+                    {
+                        sortValues[
+                            candidateIndex
+                        ] =
+                            right;
+
+                        sortValues[
+                            partner
+                        ] =
+                            left;
+                    }
+                }
+            }
+
+            __syncthreads();
+        }
+    }
+
+    // -----------------------------------------------------
+    // Emit K candidates for every active query.
+    // -----------------------------------------------------
+
+    if (sortQuerySlot <
+            activeQueries &&
+        sortThreadId <
+            topK)
+    {
+        const int queryIndex =
+            queryBase +
+            sortQuerySlot;
+
+        const std::size_t queryOffset =
+            static_cast<std::size_t>(
+                queryIndex
+            ) *
+            candidateCapacityPerQuery;
+
+        const std::size_t outputIndex =
+            queryOffset +
+            static_cast<std::size_t>(
+                blockIdx.x
+            ) *
+            static_cast<std::size_t>(
+                topK
+            ) +
+            static_cast<std::size_t>(
+                sortThreadId
+            );
+
+        output[
+            outputIndex
+        ] =
+            sortValues[
+                sortThreadId
+            ];
+    }
+}
+
 // =========================================================
 // Milestone 7 batched candidate merge
 // =========================================================
@@ -1311,6 +1725,135 @@ void launchConfiguredKernel(
         default:
             throw std::invalid_argument(
                 "Unknown distance kernel."
+            );
+    }
+}
+
+
+int selectQueryTileSize(
+    const int queryCount)
+{
+    if (queryCount >= 4)
+    {
+        return 4;
+    }
+
+    if (queryCount >= 2)
+    {
+        return 2;
+    }
+
+    return 1;
+}
+
+template <int QUERY_TILE_SIZE>
+void launchQueryTiledBatchKernel(
+    const float* database,
+    const float* queries,
+    Neighbor* output,
+    const int vectorCount,
+    const int dimension,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery,
+    const std::size_t firstBlockCount)
+{
+    const std::size_t queryTileCount =
+        ceilDivide(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                QUERY_TILE_SIZE
+            )
+        );
+
+    const dim3 grid(
+        static_cast<unsigned int>(
+            firstBlockCount
+        ),
+        static_cast<unsigned int>(
+            queryTileCount
+        ),
+        1U
+    );
+
+    queryTiledDistanceLocalTopKBatchKernel<
+        QUERY_TILE_SIZE
+    ><<<
+        grid,
+        TOPK_BLOCK_SIZE
+    >>>(
+        database,
+        queries,
+        output,
+        vectorCount,
+        dimension,
+        queryCount,
+        topK,
+        candidateCapacityPerQuery
+    );
+}
+
+void launchAdaptiveQueryTiledBatchKernel(
+    const int queryTileSize,
+    const float* database,
+    const float* queries,
+    Neighbor* output,
+    const int vectorCount,
+    const int dimension,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery,
+    const std::size_t firstBlockCount)
+{
+    switch (queryTileSize)
+    {
+        case 1:
+            launchQueryTiledBatchKernel<1>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount
+            );
+            break;
+
+        case 2:
+            launchQueryTiledBatchKernel<2>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount
+            );
+            break;
+
+        case 4:
+            launchQueryTiledBatchKernel<4>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount
+            );
+            break;
+
+        default:
+            throw std::invalid_argument(
+                "Unsupported query tile size."
             );
     }
 }
@@ -2256,6 +2799,9 @@ GpuVectorIndex::searchTopKBatch(
     result.topK =
         topK;
 
+    result.queryTileSize =
+        1;
+
     result.neighbors.resize(
         static_cast<std::size_t>(
             queryCount
@@ -2476,6 +3022,272 @@ GpuVectorIndex::searchTopKBatch(
     return result;
 }
 
+
+// =========================================================
+// Milestone 8 query-tiled batch search
+// =========================================================
+
+GpuBatchTopKResult
+GpuVectorIndex::searchTopKBatchTiled(
+    const std::vector<float>& queries,
+    const int queryCount,
+    const int topK)
+{
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between "
+            "1 and 32."
+        );
+    }
+
+    validateTopK(
+        topK,
+        vectorCount_
+    );
+
+    const std::size_t expectedElements =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                dimension_
+            ),
+            "Batch query dimensions overflow size_t."
+        );
+
+    if (queries.size() !=
+        expectedElements)
+    {
+        throw std::invalid_argument(
+            "queries.size() must equal "
+            "queryCount * dimension."
+        );
+    }
+
+    const auto totalStart =
+        std::chrono::steady_clock::now();
+
+    GpuBatchTopKResult result;
+
+    result.queryCount =
+        queryCount;
+
+    result.topK =
+        topK;
+
+    result.queryTileSize =
+        selectQueryTileSize(
+            queryCount
+        );
+
+    result.neighbors.resize(
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            topK
+        )
+    );
+
+    // -----------------------------------------------------
+    // Upload the query batch once.
+    // -----------------------------------------------------
+
+    const auto uploadStart =
+        std::chrono::steady_clock::now();
+
+    CUDA_CHECK(
+        cudaMemcpy(
+            deviceBatchQueries_.data(),
+            queries.data(),
+            expectedElements *
+                sizeof(float),
+            cudaMemcpyHostToDevice
+        )
+    );
+
+    const auto uploadEnd =
+        std::chrono::steady_clock::now();
+
+    result.queryUploadTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            uploadEnd -
+            uploadStart
+        ).count();
+
+    const std::size_t firstBlockCount =
+        ceilDivide(
+            static_cast<std::size_t>(
+                vectorCount_
+            ),
+            static_cast<std::size_t>(
+                FUSED_GROUP_SIZE
+            )
+        );
+
+    const std::size_t
+        candidateCapacityPerQuery =
+            calculateTopKBufferCapacity(
+                vectorCount_
+            );
+
+    // -----------------------------------------------------
+    // Query-tiled fused stage.
+    // -----------------------------------------------------
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            distanceStart_
+        )
+    );
+
+    launchAdaptiveQueryTiledBatchKernel(
+        result.queryTileSize,
+        deviceDatabase_.data(),
+        deviceBatchQueries_.data(),
+        deviceBatchTopKBufferA_.data(),
+        vectorCount_,
+        dimension_,
+        queryCount,
+        topK,
+        candidateCapacityPerQuery,
+        firstBlockCount
+    );
+
+    CUDA_CHECK(
+        cudaGetLastError()
+    );
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            distanceStop_
+        )
+    );
+
+    // -----------------------------------------------------
+    // Reuse the exact Milestone 7 candidate hierarchy.
+    // -----------------------------------------------------
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            topKStart_
+        )
+    );
+
+    const std::size_t
+        firstCandidateCountPerQuery =
+            firstBlockCount *
+            static_cast<std::size_t>(
+                topK
+            );
+
+    const BatchCandidateMergeResult merge =
+        mergeTopKCandidatesBatch(
+            deviceBatchTopKBufferA_.data(),
+            deviceBatchTopKBufferB_.data(),
+            firstCandidateCountPerQuery,
+            queryCount,
+            topK,
+            candidateCapacityPerQuery
+        );
+
+    result.topKPasses =
+        1 +
+        merge.mergePasses;
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            topKStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventSynchronize(
+            topKStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventElapsedTime(
+            &result.fusedKernelTimeMs,
+            distanceStart_,
+            distanceStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventElapsedTime(
+            &result.mergeKernelTimeMs,
+            topKStart_,
+            topKStop_
+        )
+    );
+
+    // -----------------------------------------------------
+    // Gather K neighbors/query into contiguous host memory.
+    // -----------------------------------------------------
+
+    const auto downloadStart =
+        std::chrono::steady_clock::now();
+
+    const std::size_t copyWidth =
+        static_cast<std::size_t>(
+            topK
+        ) *
+        sizeof(Neighbor);
+
+    const std::size_t sourcePitch =
+        candidateCapacityPerQuery *
+        sizeof(Neighbor);
+
+    CUDA_CHECK(
+        cudaMemcpy2D(
+            result.neighbors.data(),
+            copyWidth,
+            merge.finalBuffer,
+            sourcePitch,
+            copyWidth,
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            cudaMemcpyDeviceToHost
+        )
+    );
+
+    const auto downloadEnd =
+        std::chrono::steady_clock::now();
+
+    result.resultDownloadTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            downloadEnd -
+            downloadStart
+        ).count();
+
+    const auto totalEnd =
+        std::chrono::steady_clock::now();
+
+    result.totalTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            totalEnd -
+            totalStart
+        ).count();
+
+    return result;
+}
+
 // =========================================================
 // Warm-up methods
 // =========================================================
@@ -2628,3 +3440,52 @@ void GpuVectorIndex::warmUpTopKBatch(
         cudaDeviceSynchronize()
     );
 }
+
+void GpuVectorIndex::warmUpTopKBatchTiled(
+    const int queryCount,
+    const int topK,
+    const int iterations)
+{
+    if (iterations <= 0)
+    {
+        throw std::invalid_argument(
+            "Warm-up iterations must be positive."
+        );
+    }
+
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between "
+            "1 and 32."
+        );
+    }
+
+    std::vector<float> queries(
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            dimension_
+        ),
+        0.0F
+    );
+
+    for (int iteration = 0;
+         iteration < iterations;
+         ++iteration)
+    {
+        (void)searchTopKBatchTiled(
+            queries,
+            queryCount,
+            topK
+        );
+    }
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+}
+

@@ -80,6 +80,10 @@ struct GpuBatchTopKResult
     int queryCount = 0;
     int topK = 0;
 
+    // 1 for the Milestone 7 path.
+    // 1/2/4 for the adaptive Milestone 8 path.
+    int queryTileSize = 1;
+
     float fusedKernelTimeMs = 0.0F;
     float mergeKernelTimeMs = 0.0F;
 
@@ -96,6 +100,8 @@ public:
     static constexpr int MAX_TOP_K = 32;
 
     static constexpr int MAX_BATCH_SIZE = 32;
+
+    static constexpr int MAX_QUERY_TILE_SIZE = 4;
 
     static constexpr int
         FUSED_CANDIDATES_PER_BLOCK = 256;
@@ -158,19 +164,30 @@ public:
     // -----------------------------------------------------
     // Milestone 7 batched fused path
     //
-    // queries layout:
-    //
-    //   [Q0 dimensions...]
-    //   [Q1 dimensions...]
-    //   ...
-    //
-    // queries.size() must equal:
-    //
-    //   queryCount * dimension()
+    // One query is handled by each block.y slice.
     // -----------------------------------------------------
 
     [[nodiscard]]
     GpuBatchTopKResult searchTopKBatch(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK
+    );
+
+    // -----------------------------------------------------
+    // Milestone 8 query-tiled batched path
+    //
+    // One block reuses each loaded database value across
+    // multiple queries.
+    //
+    // Adaptive query tiles:
+    //   batch 1   -> tile 1
+    //   batch 2-3 -> tile 2
+    //   batch 4+  -> tile 4
+    // -----------------------------------------------------
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiled(
         const std::vector<float>& queries,
         int queryCount,
         int topK
@@ -193,6 +210,12 @@ public:
     );
 
     void warmUpTopKBatch(
+        int queryCount,
+        int topK,
+        int iterations = 1
+    );
+
+    void warmUpTopKBatchTiled(
         int queryCount,
         int topK,
         int iterations = 1
@@ -247,10 +270,9 @@ private:
     DeviceBuffer<Neighbor> deviceTopKBufferA_;
     DeviceBuffer<Neighbor> deviceTopKBufferB_;
 
-    // -----------------------------------------------------
-    // Milestone 7 persistent batch storage.
-    // -----------------------------------------------------
-
+    // Persistent batch storage shared by the M7 and M8
+    // paths. The methods execute synchronously, so the same
+    // ping-pong buffers can be reused safely.
     DeviceBuffer<float> deviceBatchQueries_;
 
     DeviceBuffer<Neighbor>

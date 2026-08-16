@@ -62,33 +62,33 @@ struct TimingStats
     double p99 = 0.0;
 };
 
-struct SequentialBatchRun
+struct PathBenchmark
 {
-    double totalTimeMs = 0.0;
-    std::vector<Neighbor> neighbors;
-};
-
-struct BatchBenchmark
-{
-    int batchSize = 0;
-
-    TimingStats batchedTotalStats;
-    TimingStats sequentialTotalStats;
-
+    TimingStats totalStats;
     TimingStats fusedKernelStats;
     TimingStats mergeStats;
     TimingStats uploadStats;
     TimingStats downloadStats;
 
-    std::vector<Neighbor> finalBatchNeighbors;
-    std::vector<Neighbor> finalSequentialNeighbors;
+    std::vector<Neighbor> finalNeighbors;
 
     int topKPasses = 0;
+    int queryTileSize = 1;
+};
 
-    bool cpuMatch = false;
-    bool sequentialMatch = false;
+struct BatchComparison
+{
+    int batchSize = 0;
 
-    float maxDistanceError = 0.0F;
+    PathBenchmark milestone7;
+    PathBenchmark milestone8;
+
+    bool m7CpuMatch = false;
+    bool m8CpuMatch = false;
+    bool m7M8Match = false;
+
+    float m7MaxError = 0.0F;
+    float m8MaxError = 0.0F;
 };
 
 } // namespace
@@ -127,7 +127,7 @@ std::vector<float> generateRandomData(
 }
 
 // =========================================================
-// CPU exact distance
+// CPU exact reference
 // =========================================================
 
 std::vector<float> calculateDistancesCpu(
@@ -188,10 +188,6 @@ std::vector<float> calculateDistancesCpu(
 
     return distances;
 }
-
-// =========================================================
-// CPU Top-K
-// =========================================================
 
 std::vector<Neighbor> findTopKNeighbors(
     const std::vector<float>& distances,
@@ -297,7 +293,7 @@ std::vector<Neighbor> searchCpuExact(
 }
 
 // =========================================================
-// Query handling
+// Query utilities
 // =========================================================
 
 std::vector<std::vector<float>>
@@ -319,15 +315,18 @@ splitQueries(
          queryIndex < queryCount;
          ++queryIndex)
     {
+        const std::size_t beginIndex =
+            static_cast<std::size_t>(
+                queryIndex
+            ) *
+            static_cast<std::size_t>(
+                dimension
+            );
+
         const auto begin =
             queries.begin() +
             static_cast<std::ptrdiff_t>(
-                static_cast<std::size_t>(
-                    queryIndex
-                ) *
-                static_cast<std::size_t>(
-                    dimension
-                )
+                beginIndex
             );
 
         const auto end =
@@ -348,7 +347,7 @@ std::vector<float> prefixQueries(
     const int queryCount,
     const int dimension)
 {
-    const std::size_t count =
+    const std::size_t elementCount =
         static_cast<std::size_t>(
             queryCount
         ) *
@@ -361,9 +360,48 @@ std::vector<float> prefixQueries(
             queries.begin(),
             queries.begin() +
                 static_cast<std::ptrdiff_t>(
-                    count
+                    elementCount
                 )
         );
+}
+
+std::vector<Neighbor> flattenCpuReferences(
+    const std::vector<
+        std::vector<Neighbor>
+    >& references,
+    const int queryCount,
+    const int topK)
+{
+    std::vector<Neighbor> result;
+
+    result.reserve(
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            topK
+        )
+    );
+
+    for (int queryIndex = 0;
+         queryIndex < queryCount;
+         ++queryIndex)
+    {
+        const auto& neighbors =
+            references[
+                static_cast<std::size_t>(
+                    queryIndex
+                )
+            ];
+
+        result.insert(
+            result.end(),
+            neighbors.begin(),
+            neighbors.end()
+        );
+    }
+
+    return result;
 }
 
 // =========================================================
@@ -492,102 +530,8 @@ TimingStats calculateStats(
 }
 
 // =========================================================
-// Sequential fused batch baseline
-// =========================================================
-
-SequentialBatchRun runSequentialBatch(
-    GpuVectorIndex& index,
-    const std::vector<std::vector<float>>& queries,
-    const int queryCount,
-    const int topK,
-    const bool captureNeighbors)
-{
-    SequentialBatchRun run;
-
-    if (captureNeighbors)
-    {
-        run.neighbors.reserve(
-            static_cast<std::size_t>(
-                queryCount
-            ) *
-            static_cast<std::size_t>(
-                topK
-            )
-        );
-    }
-
-    for (int queryIndex = 0;
-         queryIndex < queryCount;
-         ++queryIndex)
-    {
-        GpuFusedTopKResult result =
-            index.searchTopKFused(
-                queries[
-                    static_cast<std::size_t>(
-                        queryIndex
-                    )
-                ],
-                topK
-            );
-
-        run.totalTimeMs +=
-            result.totalTimeMs;
-
-        if (captureNeighbors)
-        {
-            run.neighbors.insert(
-                run.neighbors.end(),
-                result.neighbors.begin(),
-                result.neighbors.end()
-            );
-        }
-    }
-
-    return run;
-}
-
-// =========================================================
 // Correctness
 // =========================================================
-
-std::vector<Neighbor> flattenCpuReferences(
-    const std::vector<
-        std::vector<Neighbor>
-    >& references,
-    const int queryCount,
-    const int topK)
-{
-    std::vector<Neighbor> flattened;
-
-    flattened.reserve(
-        static_cast<std::size_t>(
-            queryCount
-        ) *
-        static_cast<std::size_t>(
-            topK
-        )
-    );
-
-    for (int queryIndex = 0;
-         queryIndex < queryCount;
-         ++queryIndex)
-    {
-        const auto& queryNeighbors =
-            references[
-                static_cast<std::size_t>(
-                    queryIndex
-                )
-            ];
-
-        flattened.insert(
-            flattened.end(),
-            queryNeighbors.begin(),
-            queryNeighbors.end()
-        );
-    }
-
-    return flattened;
-}
 
 bool neighborIndicesMatch(
     const std::vector<Neighbor>& expected,
@@ -646,13 +590,12 @@ float maxNeighborDistanceError(
 }
 
 // =========================================================
-// Batch benchmark
+// Milestone 7 vs Milestone 8 benchmark
 // =========================================================
 
-BatchBenchmark benchmarkBatch(
+BatchComparison benchmarkBatchComparison(
     GpuVectorIndex& index,
-    const std::vector<float>& contiguousQueries,
-    const std::vector<std::vector<float>>& splitQueryVectors,
+    const std::vector<float>& allQueries,
     const std::vector<
         std::vector<Neighbor>
     >& cpuReferences,
@@ -662,14 +605,10 @@ BatchBenchmark benchmarkBatch(
 {
     const std::vector<float> batchQueries =
         prefixQueries(
-            contiguousQueries,
+            allQueries,
             batchSize,
             dimension
         );
-
-    // -----------------------------------------------------
-    // Warm both paths.
-    // -----------------------------------------------------
 
     index.warmUpTopKBatch(
         batchSize,
@@ -677,112 +616,106 @@ BatchBenchmark benchmarkBatch(
         GPU_WARMUP_RUNS
     );
 
-    for (int warmup = 0;
-         warmup < GPU_WARMUP_RUNS;
-         ++warmup)
-    {
-        (void)runSequentialBatch(
-            index,
-            splitQueryVectors,
-            batchSize,
-            topK,
-            false
-        );
-    }
+    index.warmUpTopKBatchTiled(
+        batchSize,
+        topK,
+        GPU_WARMUP_RUNS
+    );
 
     std::vector<double>
-        batchedTotalTimes;
+        m7TotalTimes;
+    std::vector<double>
+        m7KernelTimes;
+    std::vector<double>
+        m7MergeTimes;
+    std::vector<double>
+        m7UploadTimes;
+    std::vector<double>
+        m7DownloadTimes;
 
     std::vector<double>
-        sequentialTotalTimes;
-
+        m8TotalTimes;
     std::vector<double>
-        fusedKernelTimes;
-
+        m8KernelTimes;
     std::vector<double>
-        mergeTimes;
-
+        m8MergeTimes;
     std::vector<double>
-        uploadTimes;
-
+        m8UploadTimes;
     std::vector<double>
-        downloadTimes;
+        m8DownloadTimes;
 
-    batchedTotalTimes.reserve(
+    m7TotalTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m7KernelTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m7MergeTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m7UploadTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m7DownloadTimes.reserve(
         BENCHMARK_RUNS
     );
 
-    sequentialTotalTimes.reserve(
+    m8TotalTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m8KernelTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m8MergeTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m8UploadTimes.reserve(
+        BENCHMARK_RUNS
+    );
+    m8DownloadTimes.reserve(
         BENCHMARK_RUNS
     );
 
-    fusedKernelTimes.reserve(
-        BENCHMARK_RUNS
-    );
+    GpuBatchTopKResult
+        finalM7Result;
 
-    mergeTimes.reserve(
-        BENCHMARK_RUNS
-    );
-
-    uploadTimes.reserve(
-        BENCHMARK_RUNS
-    );
-
-    downloadTimes.reserve(
-        BENCHMARK_RUNS
-    );
-
-    std::vector<Neighbor>
-        finalBatchNeighbors;
-
-    std::vector<Neighbor>
-        finalSequentialNeighbors;
-
-    int topKPasses = 0;
+    GpuBatchTopKResult
+        finalM8Result;
 
     for (int run = 0;
          run < BENCHMARK_RUNS;
          ++run)
     {
-        GpuBatchTopKResult batchResult;
-        SequentialBatchRun sequentialResult;
+        GpuBatchTopKResult m7Result;
+        GpuBatchTopKResult m8Result;
 
-        const bool capture =
-            run ==
-            BENCHMARK_RUNS - 1;
-
-        // Alternate A/B order to reduce
-        // systematic order and temperature bias.
+        // Alternate order to reduce temperature/order bias.
         if ((run & 1) == 0)
         {
-            batchResult =
+            m7Result =
                 index.searchTopKBatch(
                     batchQueries,
                     batchSize,
                     topK
                 );
 
-            sequentialResult =
-                runSequentialBatch(
-                    index,
-                    splitQueryVectors,
+            m8Result =
+                index.searchTopKBatchTiled(
+                    batchQueries,
                     batchSize,
-                    topK,
-                    capture
+                    topK
                 );
         }
         else
         {
-            sequentialResult =
-                runSequentialBatch(
-                    index,
-                    splitQueryVectors,
+            m8Result =
+                index.searchTopKBatchTiled(
+                    batchQueries,
                     batchSize,
-                    topK,
-                    capture
+                    topK
                 );
 
-            batchResult =
+            m7Result =
                 index.searchTopKBatch(
                     batchQueries,
                     batchSize,
@@ -790,155 +723,179 @@ BatchBenchmark benchmarkBatch(
                 );
         }
 
-        batchedTotalTimes.push_back(
-            batchResult.totalTimeMs
+        m7TotalTimes.push_back(
+            m7Result.totalTimeMs
         );
-
-        sequentialTotalTimes.push_back(
-            sequentialResult.totalTimeMs
-        );
-
-        fusedKernelTimes.push_back(
+        m7KernelTimes.push_back(
             static_cast<double>(
-                batchResult.fusedKernelTimeMs
+                m7Result.fusedKernelTimeMs
             )
         );
-
-        mergeTimes.push_back(
+        m7MergeTimes.push_back(
             static_cast<double>(
-                batchResult.mergeKernelTimeMs
+                m7Result.mergeKernelTimeMs
             )
         );
-
-        uploadTimes.push_back(
-            batchResult.queryUploadTimeMs
+        m7UploadTimes.push_back(
+            m7Result.queryUploadTimeMs
+        );
+        m7DownloadTimes.push_back(
+            m7Result.resultDownloadTimeMs
         );
 
-        downloadTimes.push_back(
-            batchResult.resultDownloadTimeMs
+        m8TotalTimes.push_back(
+            m8Result.totalTimeMs
+        );
+        m8KernelTimes.push_back(
+            static_cast<double>(
+                m8Result.fusedKernelTimeMs
+            )
+        );
+        m8MergeTimes.push_back(
+            static_cast<double>(
+                m8Result.mergeKernelTimeMs
+            )
+        );
+        m8UploadTimes.push_back(
+            m8Result.queryUploadTimeMs
+        );
+        m8DownloadTimes.push_back(
+            m8Result.resultDownloadTimeMs
         );
 
-        topKPasses =
-            batchResult.topKPasses;
-
-        if (capture)
+        if (run ==
+            BENCHMARK_RUNS - 1)
         {
-            finalBatchNeighbors =
+            finalM7Result =
                 std::move(
-                    batchResult.neighbors
+                    m7Result
                 );
 
-            finalSequentialNeighbors =
+            finalM8Result =
                 std::move(
-                    sequentialResult.neighbors
+                    m8Result
                 );
         }
     }
 
-    BatchBenchmark benchmark;
+    BatchComparison comparison;
 
-    benchmark.batchSize =
+    comparison.batchSize =
         batchSize;
 
-    benchmark.batchedTotalStats =
+    comparison.milestone7.totalStats =
         calculateStats(
-            batchedTotalTimes
+            m7TotalTimes
         );
-
-    benchmark.sequentialTotalStats =
+    comparison.milestone7.fusedKernelStats =
         calculateStats(
-            sequentialTotalTimes
+            m7KernelTimes
         );
-
-    benchmark.fusedKernelStats =
+    comparison.milestone7.mergeStats =
         calculateStats(
-            fusedKernelTimes
+            m7MergeTimes
         );
-
-    benchmark.mergeStats =
+    comparison.milestone7.uploadStats =
         calculateStats(
-            mergeTimes
+            m7UploadTimes
         );
-
-    benchmark.uploadStats =
+    comparison.milestone7.downloadStats =
         calculateStats(
-            uploadTimes
+            m7DownloadTimes
         );
-
-    benchmark.downloadStats =
-        calculateStats(
-            downloadTimes
-        );
-
-    benchmark.finalBatchNeighbors =
+    comparison.milestone7.finalNeighbors =
         std::move(
-            finalBatchNeighbors
+            finalM7Result.neighbors
         );
+    comparison.milestone7.topKPasses =
+        finalM7Result.topKPasses;
+    comparison.milestone7.queryTileSize =
+        finalM7Result.queryTileSize;
 
-    benchmark.finalSequentialNeighbors =
+    comparison.milestone8.totalStats =
+        calculateStats(
+            m8TotalTimes
+        );
+    comparison.milestone8.fusedKernelStats =
+        calculateStats(
+            m8KernelTimes
+        );
+    comparison.milestone8.mergeStats =
+        calculateStats(
+            m8MergeTimes
+        );
+    comparison.milestone8.uploadStats =
+        calculateStats(
+            m8UploadTimes
+        );
+    comparison.milestone8.downloadStats =
+        calculateStats(
+            m8DownloadTimes
+        );
+    comparison.milestone8.finalNeighbors =
         std::move(
-            finalSequentialNeighbors
+            finalM8Result.neighbors
+        );
+    comparison.milestone8.topKPasses =
+        finalM8Result.topKPasses;
+    comparison.milestone8.queryTileSize =
+        finalM8Result.queryTileSize;
+
+    const std::vector<Neighbor> expected =
+        flattenCpuReferences(
+            cpuReferences,
+            batchSize,
+            topK
         );
 
-    benchmark.topKPasses =
-        topKPasses;
-
-    const std::vector<Neighbor>
-        expected =
-            flattenCpuReferences(
-                cpuReferences,
-                batchSize,
-                topK
-            );
-
-    benchmark.cpuMatch =
+    comparison.m7CpuMatch =
         neighborIndicesMatch(
             expected,
-            benchmark.finalBatchNeighbors
+            comparison
+                .milestone7
+                .finalNeighbors
         );
 
-    benchmark.sequentialMatch =
+    comparison.m8CpuMatch =
         neighborIndicesMatch(
-            benchmark.finalSequentialNeighbors,
-            benchmark.finalBatchNeighbors
+            expected,
+            comparison
+                .milestone8
+                .finalNeighbors
         );
 
-    benchmark.maxDistanceError =
+    comparison.m7M8Match =
+        neighborIndicesMatch(
+            comparison
+                .milestone7
+                .finalNeighbors,
+            comparison
+                .milestone8
+                .finalNeighbors
+        );
+
+    comparison.m7MaxError =
         maxNeighborDistanceError(
             expected,
-            benchmark.finalBatchNeighbors
+            comparison
+                .milestone7
+                .finalNeighbors
         );
 
-    return benchmark;
+    comparison.m8MaxError =
+        maxNeighborDistanceError(
+            expected,
+            comparison
+                .milestone8
+                .finalNeighbors
+        );
+
+    return comparison;
 }
 
 // =========================================================
 // Printing
 // =========================================================
-
-void printStats(
-    const char* label,
-    const TimingStats& stats)
-{
-    std::cout
-        << label
-        << '\n'
-        << "  Min:       "
-        << stats.minimum
-        << " ms\n"
-        << "  Average:   "
-        << stats.average
-        << " ms\n"
-        << "  P50:       "
-        << stats.p50
-        << " ms\n"
-        << "  P95:       "
-        << stats.p95
-        << " ms\n"
-        << "  P99:       "
-        << stats.p99
-        << " ms\n";
-}
 
 void printFirstQueryNeighbors(
     const std::vector<Neighbor>& neighbors,
@@ -1065,7 +1022,7 @@ int main(
 
         std::cout
             << "============================================\n"
-            << "       Vortex CUDA Batched Exact Search\n"
+            << "    Vortex CUDA Query-Tiled Batch Search\n"
             << "============================================\n\n"
             << "GPU: "
             << device.name
@@ -1089,14 +1046,17 @@ int main(
             << "Max batch size: "
             << GpuVectorIndex::MAX_BATCH_SIZE
             << '\n'
-            << "Benchmark runs/batch: "
+            << "Max query tile: "
+            << GpuVectorIndex::MAX_QUERY_TILE_SIZE
+            << '\n'
+            << "Benchmark runs/path: "
             << BENCHMARK_RUNS
             << '\n'
             << "A/B ordering: alternating"
             << "\n\n";
 
         // -------------------------------------------------
-        // Dataset
+        // Data
         // -------------------------------------------------
 
         std::cout
@@ -1168,10 +1128,7 @@ int main(
             << " ms\n";
 
         // -------------------------------------------------
-        // CPU correctness references.
-        //
-        // Only one CPU execution/query is required here.
-        // CPU performance was benchmarked in Milestone 6.
+        // CPU correctness references
         // -------------------------------------------------
 
         std::cout
@@ -1211,13 +1168,13 @@ int main(
         }
 
         // -------------------------------------------------
-        // Benchmark all batch sizes.
+        // M7 vs M8
         // -------------------------------------------------
 
-        std::vector<BatchBenchmark>
-            benchmarks;
+        std::vector<BatchComparison>
+            comparisons;
 
-        benchmarks.reserve(
+        comparisons.reserve(
             BATCH_SIZES.size()
         );
 
@@ -1229,11 +1186,10 @@ int main(
                 << batchSize
                 << "...\n";
 
-            benchmarks.push_back(
-                benchmarkBatch(
+            comparisons.push_back(
+                benchmarkBatchComparison(
                     gpuIndex,
                     allQueries,
-                    splitQueryVectors,
                     cpuReferences,
                     batchSize,
                     dimension,
@@ -1242,99 +1198,116 @@ int main(
             );
         }
 
-        // -------------------------------------------------
-        // Validate all batch sizes.
-        // -------------------------------------------------
-
         bool allCorrect = true;
 
-        for (const BatchBenchmark&
-             benchmark :
-             benchmarks)
+        for (const BatchComparison&
+             comparison :
+             comparisons)
         {
-            const bool numericPass =
+            const bool m7Numeric =
                 std::isfinite(
-                    benchmark.maxDistanceError
+                    comparison.m7MaxError
                 ) &&
-                benchmark.maxDistanceError <=
+                comparison.m7MaxError <=
+                    MAX_ALLOWED_ERROR;
+
+            const bool m8Numeric =
+                std::isfinite(
+                    comparison.m8MaxError
+                ) &&
+                comparison.m8MaxError <=
                     MAX_ALLOWED_ERROR;
 
             allCorrect =
                 allCorrect &&
-                benchmark.cpuMatch &&
-                benchmark.sequentialMatch &&
-                numericPass;
+                comparison.m7CpuMatch &&
+                comparison.m8CpuMatch &&
+                comparison.m7M8Match &&
+                m7Numeric &&
+                m8Numeric;
         }
 
         // -------------------------------------------------
-        // Results
+        // Table
         // -------------------------------------------------
 
         std::cout
             << "\n\n============================================\n"
-            << "            Batch Benchmark Results\n"
+            << "       Query-Tiled Batch Benchmark Results\n"
             << "============================================\n";
 
         std::cout
-            << "\nBatch   Batch P50   Batch P95   "
-            << "ms/query   QPS       Seq P50   Gain\n"
+            << "\nBatch Tile   M7 P50   M8 P50   M8 P95"
+            << "   M7 QPS    M8 QPS    Gain\n"
             << "------------------------------------------------"
-            << "----------------\n";
+            << "--------------------\n";
 
-        for (const BatchBenchmark&
-             benchmark :
-             benchmarks)
+        for (const BatchComparison&
+             comparison :
+             comparisons)
         {
-            const double
-                amortizedLatency =
-                    benchmark
-                        .batchedTotalStats
-                        .p50 /
-                    static_cast<double>(
-                        benchmark.batchSize
-                    );
-
-            const double qps =
+            const double m7Qps =
                 static_cast<double>(
-                    benchmark.batchSize
+                    comparison.batchSize
                 ) *
                 1000.0 /
-                benchmark
-                    .batchedTotalStats
+                comparison
+                    .milestone7
+                    .totalStats
+                    .p50;
+
+            const double m8Qps =
+                static_cast<double>(
+                    comparison.batchSize
+                ) *
+                1000.0 /
+                comparison
+                    .milestone8
+                    .totalStats
                     .p50;
 
             const double gain =
-                benchmark
-                    .sequentialTotalStats
+                comparison
+                    .milestone7
+                    .totalStats
                     .p50 /
-                benchmark
-                    .batchedTotalStats
+                comparison
+                    .milestone8
+                    .totalStats
                     .p50;
 
             std::cout
                 << std::setw(5)
-                << benchmark.batchSize
+                << comparison.batchSize
+                << " "
+                << std::setw(4)
+                << comparison
+                    .milestone8
+                    .queryTileSize
                 << "   "
-                << std::setw(9)
-                << benchmark
-                    .batchedTotalStats
+                << std::setw(7)
+                << comparison
+                    .milestone7
+                    .totalStats
                     .p50
                 << "   "
-                << std::setw(9)
-                << benchmark
-                    .batchedTotalStats
+                << std::setw(7)
+                << comparison
+                    .milestone8
+                    .totalStats
+                    .p50
+                << "   "
+                << std::setw(7)
+                << comparison
+                    .milestone8
+                    .totalStats
                     .p95
                 << "   "
                 << std::setw(8)
-                << amortizedLatency
+                << m7Qps
                 << "   "
                 << std::setw(8)
-                << qps
-                << "   "
-                << std::setw(8)
-                << benchmark
-                    .sequentialTotalStats
-                    .p50
+                << m8Qps
                 << "   "
                 << std::setw(5)
                 << gain
@@ -1342,30 +1315,36 @@ int main(
         }
 
         // -------------------------------------------------
-        // Best throughput configuration.
+        // Best M8 throughput
         // -------------------------------------------------
 
         const auto bestIterator =
             std::max_element(
-                benchmarks.begin(),
-                benchmarks.end(),
+                comparisons.begin(),
+                comparisons.end(),
                 [](
-                    const BatchBenchmark& left,
-                    const BatchBenchmark& right)
+                    const BatchComparison& left,
+                    const BatchComparison& right)
                 {
                     const double leftQps =
                         static_cast<double>(
                             left.batchSize
                         ) *
                         1000.0 /
-                        left.batchedTotalStats.p50;
+                        left
+                            .milestone8
+                            .totalStats
+                            .p50;
 
                     const double rightQps =
                         static_cast<double>(
                             right.batchSize
                         ) *
                         1000.0 /
-                        right.batchedTotalStats.p50;
+                        right
+                            .milestone8
+                            .totalStats
+                            .p50;
 
                     return
                         leftQps <
@@ -1374,105 +1353,148 @@ int main(
             );
 
         if (bestIterator ==
-            benchmarks.end())
+            comparisons.end())
         {
             throw std::runtime_error(
-                "No batch benchmark results."
+                "No benchmark results."
             );
         }
 
-        const BatchBenchmark&
-            bestBenchmark =
+        const BatchComparison&
+            best =
                 *bestIterator;
 
-        const double bestQps =
+        const double m7BestQps =
             static_cast<double>(
-                bestBenchmark.batchSize
+                best.batchSize
             ) *
             1000.0 /
-            bestBenchmark
-                .batchedTotalStats
+            best
+                .milestone7
+                .totalStats
                 .p50;
 
-        const double bestAmortizedP50 =
-            bestBenchmark
-                .batchedTotalStats
-                .p50 /
+        const double m8BestQps =
             static_cast<double>(
-                bestBenchmark.batchSize
-            );
-
-        const double bestAmortizedP95 =
-            bestBenchmark
-                .batchedTotalStats
-                .p95 /
-            static_cast<double>(
-                bestBenchmark.batchSize
-            );
+                best.batchSize
+            ) *
+            1000.0 /
+            best
+                .milestone8
+                .totalStats
+                .p50;
 
         const double bestGain =
-            bestBenchmark
-                .sequentialTotalStats
+            best
+                .milestone7
+                .totalStats
                 .p50 /
-            bestBenchmark
-                .batchedTotalStats
+            best
+                .milestone8
+                .totalStats
                 .p50;
 
+        const double amortizedP50 =
+            best
+                .milestone8
+                .totalStats
+                .p50 /
+            static_cast<double>(
+                best.batchSize
+            );
+
+        const double amortizedP95 =
+            best
+                .milestone8
+                .totalStats
+                .p95 /
+            static_cast<double>(
+                best.batchSize
+            );
+
         std::cout
-            << "\nBest Throughput Configuration\n"
+            << "\nBest Query-Tiled Throughput\n"
             << "--------------------------------------------\n"
             << "Batch size:                 "
-            << bestBenchmark.batchSize
+            << best.batchSize
             << '\n'
-            << "Batch P50:                  "
-            << bestBenchmark
-                .batchedTotalStats
+            << "Query tile size:            "
+            << best
+                .milestone8
+                .queryTileSize
+            << '\n'
+            << "M7 batch P50:               "
+            << best
+                .milestone7
+                .totalStats
                 .p50
             << " ms\n"
-            << "Batch P95:                  "
-            << bestBenchmark
-                .batchedTotalStats
+            << "M8 batch P50:               "
+            << best
+                .milestone8
+                .totalStats
+                .p50
+            << " ms\n"
+            << "M8 batch P95:               "
+            << best
+                .milestone8
+                .totalStats
                 .p95
             << " ms\n"
-            << "Amortized P50/query:        "
-            << bestAmortizedP50
+            << "M8 batch P99:               "
+            << best
+                .milestone8
+                .totalStats
+                .p99
             << " ms\n"
-            << "Amortized P95/query:        "
-            << bestAmortizedP95
+            << "Amortized M8 P50/query:     "
+            << amortizedP50
             << " ms\n"
-            << "Throughput:                 "
-            << bestQps
+            << "Amortized M8 P95/query:     "
+            << amortizedP95
+            << " ms\n"
+            << "M7 throughput:              "
+            << m7BestQps
             << " queries/sec\n"
-            << "Sequential same-work P50:  "
-            << bestBenchmark
-                .sequentialTotalStats
-                .p50
-            << " ms\n"
-            << "Batch throughput gain:      "
+            << "M8 throughput:              "
+            << m8BestQps
+            << " queries/sec\n"
+            << "M8 vs M7 throughput gain:   "
             << bestGain
             << "x\n"
-            << "Fused batch kernel P50:     "
-            << bestBenchmark
+            << "M7 fused kernel P50:        "
+            << best
+                .milestone7
                 .fusedKernelStats
                 .p50
             << " ms\n"
-            << "Candidate merge P50:        "
-            << bestBenchmark
+            << "M8 tiled kernel P50:        "
+            << best
+                .milestone8
+                .fusedKernelStats
+                .p50
+            << " ms\n"
+            << "M8 candidate merge P50:     "
+            << best
+                .milestone8
                 .mergeStats
                 .p50
             << " ms\n"
-            << "Query upload P50:           "
-            << bestBenchmark
+            << "M8 query upload P50:        "
+            << best
+                .milestone8
                 .uploadStats
                 .p50
             << " ms\n"
-            << "Top-K download P50:         "
-            << bestBenchmark
+            << "M8 Top-K download P50:      "
+            << best
+                .milestone8
                 .downloadStats
                 .p50
             << " ms\n"
             << "Top-K hierarchy passes:     "
-            << bestBenchmark
+            << best
+                .milestone8
                 .topKPasses
             << '\n';
 
@@ -1485,61 +1507,96 @@ int main(
             << "--------------------------------------------\n"
             << std::setprecision(8);
 
-        for (const BatchBenchmark&
-             benchmark :
-             benchmarks)
+        for (const BatchComparison&
+             comparison :
+             comparisons)
         {
-            const bool numericPass =
+            const bool m7Numeric =
                 std::isfinite(
-                    benchmark.maxDistanceError
+                    comparison.m7MaxError
                 ) &&
-                benchmark.maxDistanceError <=
+                comparison.m7MaxError <=
+                    MAX_ALLOWED_ERROR;
+
+            const bool m8Numeric =
+                std::isfinite(
+                    comparison.m8MaxError
+                ) &&
+                comparison.m8MaxError <=
                     MAX_ALLOWED_ERROR;
 
             std::cout
                 << "Batch "
                 << std::setw(2)
-                << benchmark.batchSize
-                << "  CPU="
+                << comparison.batchSize
+                << "  M7CPU="
                 << (
-                    benchmark.cpuMatch
+                    comparison.m7CpuMatch
                         ? "PASS"
                         : "FAIL"
                 )
-                << "  Sequential="
+                << "  M8CPU="
                 << (
-                    benchmark.sequentialMatch
+                    comparison.m8CpuMatch
                         ? "PASS"
                         : "FAIL"
                 )
-                << "  Numeric="
+                << "  M7vsM8="
                 << (
-                    numericPass
+                    comparison.m7M8Match
                         ? "PASS"
                         : "FAIL"
                 )
-                << "  maxError="
-                << benchmark.maxDistanceError
+                << "  M7Num="
+                << (
+                    m7Numeric
+                        ? "PASS"
+                        : "FAIL"
+                )
+                << "  M8Num="
+                << (
+                    m8Numeric
+                        ? "PASS"
+                        : "FAIL"
+                )
+                << "  M8Error="
+                << comparison.m8MaxError
                 << '\n';
         }
 
         if (!allCorrect)
         {
             std::cerr
-                << "\nMilestone 7 correctness "
+                << "\nMilestone 8 correctness "
                 << "validation failed.\n";
 
             return EXIT_FAILURE;
         }
 
         printFirstQueryNeighbors(
-            bestBenchmark
-                .finalBatchNeighbors,
+            best
+                .milestone8
+                .finalNeighbors,
             topK
         );
 
         std::cout
-            << "\nMilestone 7 completed successfully.\n";
+            << "\nMilestone 8 completed successfully.\n";
+
+        if (bestGain >
+            1.0)
+        {
+            std::cout
+                << "Query tiling improved measured "
+                << "batch throughput.\n";
+        }
+        else
+        {
+            std::cout
+                << "Query tiling did not improve measured "
+                << "throughput; retain Milestone 7 as the "
+                << "performance default until further tuning.\n";
+        }
 
         return EXIT_SUCCESS;
     }

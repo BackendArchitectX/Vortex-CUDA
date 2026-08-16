@@ -81,8 +81,13 @@ struct GpuBatchTopKResult
     int topK = 0;
 
     // 1 for the Milestone 7 path.
-    // 1/2/4 for the adaptive Milestone 8 path.
+    // 1/2/4 for the adaptive Milestone 8/M10 paths.
     int queryTileSize = 1;
+
+    // True when the Milestone 10 float4 path was used.
+    // False for M7/M8 and for M10's scalar fallback when
+    // dimension is not divisible by four.
+    bool vectorizedLoadsUsed = false;
 
     float fusedKernelTimeMs = 0.0F;
     float mergeKernelTimeMs = 0.0F;
@@ -193,6 +198,21 @@ public:
         int topK
     );
 
+    // -----------------------------------------------------
+    // Milestone 10 vectorized query-tiled path
+    //
+    // Uses aligned float4 database/query loads when
+    // dimension % 4 == 0. Otherwise it falls back to the
+    // validated Milestone 8 scalar query-tiled kernel.
+    // -----------------------------------------------------
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiledVectorized(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK
+    );
+
     void warmUp(
         const GpuSearchConfig& config,
         int iterations = 1
@@ -216,6 +236,12 @@ public:
     );
 
     void warmUpTopKBatchTiled(
+        int queryCount,
+        int topK,
+        int iterations = 1
+    );
+
+    void warmUpTopKBatchTiledVectorized(
         int queryCount,
         int topK,
         int iterations = 1
@@ -270,8 +296,8 @@ private:
     DeviceBuffer<Neighbor> deviceTopKBufferA_;
     DeviceBuffer<Neighbor> deviceTopKBufferB_;
 
-    // Persistent batch storage shared by the M7 and M8
-    // paths. The methods execute synchronously, so the same
+    // Persistent batch storage shared by the M7, M8 and
+    // M10 paths. The methods execute synchronously, so the same
     // ping-pong buffers can be reused safely.
     DeviceBuffer<float> deviceBatchQueries_;
 

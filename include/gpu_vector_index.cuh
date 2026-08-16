@@ -3,6 +3,7 @@
 #include "device_buffer.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <array>
 #include <cstddef>
@@ -94,6 +95,10 @@ struct GpuBatchTopKResult
     // float4 kernel that uses explicit FP32 FMA accumulation
     // and shorter temporary live ranges.
     bool fmaTunedKernelUsed = false;
+
+    // Milestone 14 mixed-precision metadata.
+    bool mixedPrecisionUsed = false;
+    bool half2LoadsUsed = false;
 
     float fusedKernelTimeMs = 0.0F;
     float mergeKernelTimeMs = 0.0F;
@@ -388,6 +393,49 @@ public:
         int iterations = 1
     );
 
+
+    // -----------------------------------------------------
+    // Milestone 14 mixed-precision index
+    //
+    // Database vectors are stored as FP16 on the GPU to
+    // reduce resident index footprint and memory traffic.
+    // Distance arithmetic remains FP32. Even dimensions use
+    // packed half2 loads; odd dimensions use a scalar FP16
+    // fallback while retaining the same Top-K hierarchy.
+    // -----------------------------------------------------
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiledFp16Auto(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK
+    );
+
+    void warmUpTopKBatchTiledFp16Auto(
+        int queryCount,
+        int topK,
+        int iterations = 1
+    );
+
+    [[nodiscard]]
+    std::size_t fp16IndexBytes() const noexcept
+    {
+        return
+            static_cast<std::size_t>(
+                vectorCount_
+            ) *
+            static_cast<std::size_t>(
+                dimension_
+            ) *
+            sizeof(__half);
+    }
+
+    [[nodiscard]]
+    double fp16IndexBuildTimeMs() const noexcept
+    {
+        return fp16IndexBuildTimeMs_;
+    }
+
     [[nodiscard]]
     int asyncEngineCount() const noexcept
     {
@@ -443,6 +491,14 @@ private:
 
 
     [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiledFp16WithTile(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK,
+        int queryTileSize
+    );
+
+    [[nodiscard]]
     GpuBatchTopKResult searchTopKBatchTiledVectorizedFmaWithTile(
         const std::vector<float>& queries,
         int queryCount,
@@ -479,6 +535,7 @@ private:
     int dimension_;
 
     DeviceBuffer<float> deviceDatabase_;
+    DeviceBuffer<__half> deviceHalfDatabase_;
 
     // Single-query storage.
     DeviceBuffer<float> deviceQuery_;
@@ -526,4 +583,5 @@ private:
     cudaEvent_t topKStop_{};
 
     double indexUploadTimeMs_ = 0.0;
+    double fp16IndexBuildTimeMs_ = 0.0;
 };

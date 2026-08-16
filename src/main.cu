@@ -46,6 +46,15 @@ constexpr int PIPELINE_BENCHMARK_RUNS =
 constexpr int PIPELINE_WARMUP_RUNS =
     2;
 
+constexpr int MIXED_PRECISION_WARMUP_RUNS =
+    5;
+
+constexpr int MIXED_PRECISION_BENCHMARK_RUNS =
+    50;
+
+constexpr double MIN_M14_RECALL_AT_K =
+    0.98;
+
 constexpr float MAX_ALLOWED_ERROR =
     0.001F;
 
@@ -108,6 +117,29 @@ struct PipelineComparison
 
     bool indicesMatch = false;
     float maxDistanceError = 0.0F;
+};
+
+struct MixedPrecisionComparison
+{
+    TimingStats fp32TotalStats;
+    TimingStats fp16TotalStats;
+    TimingStats fp32KernelStats;
+    TimingStats fp16KernelStats;
+
+    std::vector<Neighbor> fp32Neighbors;
+    std::vector<Neighbor> fp16Neighbors;
+
+    int queryCount = 0;
+    int topK = 0;
+    int queryTileSize = 1;
+
+    bool half2LoadsUsed = false;
+
+    double recallAt1 = 0.0;
+    double recallAtK = 0.0;
+    double meanMatchedDistanceError = 0.0;
+    float maxMatchedDistanceError = 0.0F;
+    bool distancesFinite = false;
 };
 
 struct BatchComparison
@@ -919,6 +951,411 @@ BatchComparison benchmarkBatchComparison(
     return comparison;
 }
 
+
+
+// =========================================================
+// Milestone 14 mixed-precision validation / benchmark
+// =========================================================
+
+double topKRecall(
+    const std::vector<Neighbor>& reference,
+    const std::vector<Neighbor>& candidate,
+    const int queryCount,
+    const int topK,
+    const int cutoff)
+{
+    if (cutoff <= 0 ||
+        cutoff > topK)
+    {
+        throw std::invalid_argument(
+            "Recall cutoff must be between 1 and topK."
+        );
+    }
+
+    const std::size_t expectedSize =
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            topK
+        );
+
+    if (reference.size() != expectedSize ||
+        candidate.size() != expectedSize)
+    {
+        throw std::invalid_argument(
+            "Top-K arrays have an unexpected size."
+        );
+    }
+
+    std::size_t matches = 0;
+
+    for (int queryIndex = 0;
+         queryIndex <
+             queryCount;
+         ++queryIndex)
+    {
+        const std::size_t base =
+            static_cast<std::size_t>(
+                queryIndex
+            ) *
+            static_cast<std::size_t>(
+                topK
+            );
+
+        for (int referenceRank = 0;
+             referenceRank <
+                 cutoff;
+             ++referenceRank)
+        {
+            const int referenceIndex =
+                reference[
+                    base +
+                    static_cast<std::size_t>(
+                        referenceRank
+                    )
+                ].index;
+
+            for (int candidateRank = 0;
+                 candidateRank <
+                     cutoff;
+                 ++candidateRank)
+            {
+                if (candidate[
+                        base +
+                        static_cast<std::size_t>(
+                            candidateRank
+                        )
+                    ].index ==
+                    referenceIndex)
+                {
+                    ++matches;
+                    break;
+                }
+            }
+        }
+    }
+
+    return
+        static_cast<double>(
+            matches
+        ) /
+        static_cast<double>(
+            queryCount *
+            cutoff
+        );
+}
+
+std::pair<double, float> matchedDistanceErrors(
+    const std::vector<Neighbor>& reference,
+    const std::vector<Neighbor>& candidate,
+    const int queryCount,
+    const int topK)
+{
+    double totalError = 0.0;
+    float maxError = 0.0F;
+    std::size_t matchedCount = 0;
+
+    for (int queryIndex = 0;
+         queryIndex <
+             queryCount;
+         ++queryIndex)
+    {
+        const std::size_t base =
+            static_cast<std::size_t>(
+                queryIndex
+            ) *
+            static_cast<std::size_t>(
+                topK
+            );
+
+        for (int referenceRank = 0;
+             referenceRank <
+                 topK;
+             ++referenceRank)
+        {
+            const Neighbor& expected =
+                reference[
+                    base +
+                    static_cast<std::size_t>(
+                        referenceRank
+                    )
+                ];
+
+            for (int candidateRank = 0;
+                 candidateRank <
+                     topK;
+                 ++candidateRank)
+            {
+                const Neighbor& actual =
+                    candidate[
+                        base +
+                        static_cast<std::size_t>(
+                            candidateRank
+                        )
+                    ];
+
+                if (actual.index ==
+                    expected.index)
+                {
+                    const float error =
+                        std::abs(
+                            actual.distance -
+                            expected.distance
+                        );
+
+                    totalError +=
+                        static_cast<double>(
+                            error
+                        );
+
+                    maxError =
+                        std::max(
+                            maxError,
+                            error
+                        );
+
+                    ++matchedCount;
+                    break;
+                }
+            }
+        }
+    }
+
+    const double meanError =
+        matchedCount == 0
+            ? std::numeric_limits<double>::infinity()
+            : totalError /
+                static_cast<double>(
+                    matchedCount
+                );
+
+    return {
+        meanError,
+        maxError
+    };
+}
+
+bool allNeighborDistancesFinite(
+    const std::vector<Neighbor>& neighbors)
+{
+    return
+        std::all_of(
+            neighbors.begin(),
+            neighbors.end(),
+            [](const Neighbor& neighbor)
+            {
+                return
+                    std::isfinite(
+                        neighbor.distance
+                    );
+            }
+        );
+}
+
+MixedPrecisionComparison benchmarkMixedPrecision(
+    GpuVectorIndex& index,
+    const std::vector<float>& allQueries,
+    const int queryCount,
+    const int dimension,
+    const int topK)
+{
+    const std::vector<float> queries =
+        prefixQueries(
+            allQueries,
+            queryCount,
+            dimension
+        );
+
+    // Reuse the M11-selected tile for both paths so the A/B
+    // comparison isolates storage precision and load width.
+    (void)index.autotuneVectorizedQueryTileSize(
+        queries,
+        queryCount,
+        topK,
+        7
+    );
+
+    index.warmUpTopKBatchTiledVectorizedFmaAuto(
+        queryCount,
+        topK,
+        MIXED_PRECISION_WARMUP_RUNS
+    );
+
+    index.warmUpTopKBatchTiledFp16Auto(
+        queryCount,
+        topK,
+        MIXED_PRECISION_WARMUP_RUNS
+    );
+
+    std::vector<double> fp32Total;
+    std::vector<double> fp16Total;
+    std::vector<double> fp32Kernel;
+    std::vector<double> fp16Kernel;
+
+    fp32Total.reserve(
+        MIXED_PRECISION_BENCHMARK_RUNS
+    );
+    fp16Total.reserve(
+        MIXED_PRECISION_BENCHMARK_RUNS
+    );
+    fp32Kernel.reserve(
+        MIXED_PRECISION_BENCHMARK_RUNS
+    );
+    fp16Kernel.reserve(
+        MIXED_PRECISION_BENCHMARK_RUNS
+    );
+
+    GpuBatchTopKResult finalFp32;
+    GpuBatchTopKResult finalFp16;
+
+    for (int run = 0;
+         run <
+             MIXED_PRECISION_BENCHMARK_RUNS;
+         ++run)
+    {
+        GpuBatchTopKResult fp32;
+        GpuBatchTopKResult fp16;
+
+        if ((run & 1) == 0)
+        {
+            fp32 =
+                index.searchTopKBatchTiledVectorizedFmaAuto(
+                    queries,
+                    queryCount,
+                    topK
+                );
+
+            fp16 =
+                index.searchTopKBatchTiledFp16Auto(
+                    queries,
+                    queryCount,
+                    topK
+                );
+        }
+        else
+        {
+            fp16 =
+                index.searchTopKBatchTiledFp16Auto(
+                    queries,
+                    queryCount,
+                    topK
+                );
+
+            fp32 =
+                index.searchTopKBatchTiledVectorizedFmaAuto(
+                    queries,
+                    queryCount,
+                    topK
+                );
+        }
+
+        fp32Total.push_back(
+            fp32.totalTimeMs
+        );
+        fp16Total.push_back(
+            fp16.totalTimeMs
+        );
+        fp32Kernel.push_back(
+            static_cast<double>(
+                fp32.fusedKernelTimeMs
+            )
+        );
+        fp16Kernel.push_back(
+            static_cast<double>(
+                fp16.fusedKernelTimeMs
+            )
+        );
+
+        if (run ==
+            MIXED_PRECISION_BENCHMARK_RUNS - 1)
+        {
+            finalFp32 =
+                std::move(
+                    fp32
+                );
+
+            finalFp16 =
+                std::move(
+                    fp16
+                );
+        }
+    }
+
+    MixedPrecisionComparison comparison;
+
+    comparison.fp32TotalStats =
+        calculateStats(
+            fp32Total
+        );
+    comparison.fp16TotalStats =
+        calculateStats(
+            fp16Total
+        );
+    comparison.fp32KernelStats =
+        calculateStats(
+            fp32Kernel
+        );
+    comparison.fp16KernelStats =
+        calculateStats(
+            fp16Kernel
+        );
+
+    comparison.fp32Neighbors =
+        std::move(
+            finalFp32.neighbors
+        );
+    comparison.fp16Neighbors =
+        std::move(
+            finalFp16.neighbors
+        );
+
+    comparison.queryCount =
+        queryCount;
+    comparison.topK =
+        topK;
+    comparison.queryTileSize =
+        finalFp16.queryTileSize;
+    comparison.half2LoadsUsed =
+        finalFp16.half2LoadsUsed;
+
+    comparison.recallAt1 =
+        topKRecall(
+            comparison.fp32Neighbors,
+            comparison.fp16Neighbors,
+            queryCount,
+            topK,
+            1
+        );
+
+    comparison.recallAtK =
+        topKRecall(
+            comparison.fp32Neighbors,
+            comparison.fp16Neighbors,
+            queryCount,
+            topK,
+            topK
+        );
+
+    const auto [meanError, maxError] =
+        matchedDistanceErrors(
+            comparison.fp32Neighbors,
+            comparison.fp16Neighbors,
+            queryCount,
+            topK
+        );
+
+    comparison.meanMatchedDistanceError =
+        meanError;
+    comparison.maxMatchedDistanceError =
+        maxError;
+    comparison.distancesFinite =
+        allNeighborDistancesFinite(
+            comparison.fp16Neighbors
+        );
+
+    return comparison;
+}
 
 // =========================================================
 // Milestone 13 sequential-vs-pipelined benchmark
@@ -1779,6 +2216,216 @@ int runProfileMode(
 // Main
 // =========================================================
 
+
+int runM14ProfileMode(
+    const int argc,
+    char** argv)
+{
+    if (argc != 6)
+    {
+        std::cerr
+            << "Usage: vortex_cuda --profile-m14 "
+            << "<vectorCount> <dimension> <topK> <batchSize>\n";
+
+        return EXIT_FAILURE;
+    }
+
+    const int vectorCount =
+        std::stoi(
+            argv[2]
+        );
+    const int dimension =
+        std::stoi(
+            argv[3]
+        );
+    const int topK =
+        std::stoi(
+            argv[4]
+        );
+    const int batchSize =
+        std::stoi(
+            argv[5]
+        );
+
+    if (vectorCount <= 0 ||
+        dimension <= 0 ||
+        topK <= 0 ||
+        topK >
+            GpuVectorIndex::MAX_TOP_K ||
+        topK >
+            vectorCount ||
+        batchSize <= 0 ||
+        batchSize >
+            GpuVectorIndex::MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "Invalid M14 profile dimensions."
+        );
+    }
+
+    cudaDeviceProp device{};
+    CUDA_CHECK(
+        cudaGetDeviceProperties(
+            &device,
+            0
+        )
+    );
+
+    std::cout
+        << "============================================\n"
+        << "       Vortex CUDA M14 Profile Mode\n"
+        << "============================================\n\n"
+        << "GPU: "
+        << device.name
+        << '\n'
+        << "Dataset: "
+        << vectorCount
+        << " x "
+        << dimension
+        << '\n'
+        << "Top-K: "
+        << topK
+        << '\n'
+        << "Batch size: "
+        << batchSize
+        << '\n'
+        << "FP16 packed half2 eligible: "
+        << (
+            (dimension % 2) == 0
+                ? "yes"
+                : "no - scalar FP16 fallback"
+        )
+        << "\n\n";
+
+    const std::size_t databaseElements =
+        static_cast<std::size_t>(
+            vectorCount
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    const std::size_t queryElements =
+        static_cast<std::size_t>(
+            batchSize
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    std::cout
+        << "Generating deterministic profile dataset...\n";
+
+    const std::vector<float> database =
+        generateRandomData(
+            databaseElements,
+            42U
+        );
+
+    const std::vector<float> queries =
+        generateRandomData(
+            queryElements,
+            1337U
+        );
+
+    std::cout
+        << "Building FP32 + FP16 persistent GPU indexes...\n";
+
+    GpuVectorIndex index(
+        database,
+        vectorCount,
+        dimension
+    );
+
+    std::cout
+        << "Autotuning query tile outside profiler range...\n";
+
+    const GpuQueryTileTuningResult tuning =
+        index.autotuneVectorizedQueryTileSize(
+            queries,
+            batchSize,
+            topK,
+            7
+        );
+
+    std::cout
+        << "Selected query tile: "
+        << tuning.selectedTileSize
+        << "\nRunning M14 warm-ups outside profiler range...\n";
+
+    index.warmUpTopKBatchTiledFp16Auto(
+        batchSize,
+        topK,
+        3
+    );
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+
+    std::cout
+        << "Starting focused M14 profile region...\n";
+
+    CUDA_CHECK(
+        cudaProfilerStart()
+    );
+
+    const GpuBatchTopKResult result =
+        index.searchTopKBatchTiledFp16Auto(
+            queries,
+            batchSize,
+            topK
+        );
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+
+    CUDA_CHECK(
+        cudaProfilerStop()
+    );
+
+    std::cout
+        << std::fixed
+        << std::setprecision(3)
+        << "\nFocused profile run completed.\n"
+        << "Storage precision:      FP16\n"
+        << "Accumulation precision: FP32\n"
+        << "Half2 loads:            "
+        << (
+            result.half2LoadsUsed
+                ? "yes"
+                : "no"
+        )
+        << '\n'
+        << "Query tile size:        "
+        << result.queryTileSize
+        << '\n'
+        << "FP32 index bytes:       "
+        << index.indexBytes()
+        << '\n'
+        << "FP16 index bytes:       "
+        << index.fp16IndexBytes()
+        << '\n'
+        << "FP16 index build time:  "
+        << index.fp16IndexBuildTimeMs()
+        << " ms\n"
+        << "M14 kernel time:        "
+        << result.fusedKernelTimeMs
+        << " ms\n"
+        << "Candidate merge time:   "
+        << result.mergeKernelTimeMs
+        << " ms\n"
+        << "End-to-end time:        "
+        << result.totalTimeMs
+        << " ms\n"
+        << "Returned neighbors:     "
+        << result.neighbors.size()
+        << '\n';
+
+    return EXIT_SUCCESS;
+}
+
 int main(
     const int argc,
     char** argv)
@@ -1790,6 +2437,16 @@ int main(
             const std::string mode(
                 argv[1]
             );
+
+            if (mode ==
+                "--profile-m14")
+            {
+                return
+                    runM14ProfileMode(
+                        argc,
+                        argv
+                    );
+            }
 
             if (mode ==
                 "--profile-m8")
@@ -1924,7 +2581,7 @@ int main(
 
         std::cout
             << "============================================\n"
-            << " Vortex CUDA Dual-Stream Pipelined Search\n"
+            << " Vortex CUDA Mixed-Precision Vector Search\n"
             << "============================================\n\n"
             << "GPU: "
             << device.name
@@ -2041,9 +2698,18 @@ int main(
             << "Index size:       "
             << indexSizeMiB
             << " MiB\n"
-            << "One-time upload:  "
+            << "One-time FP32 upload: "
             << gpuIndex.indexUploadTimeMs()
-            << " ms\n";
+            << " ms\n"
+            << "FP16 index size:       "
+            << static_cast<double>(
+                gpuIndex.fp16IndexBytes()
+            ) /
+            (1024.0 * 1024.0)
+            << " MiB\n"
+            << "FP16 index build:      "
+            << gpuIndex.fp16IndexBuildTimeMs()
+            << " ms\n\n";
 
         std::cout
             << "\nBuilding CPU correctness references "
@@ -2714,6 +3380,154 @@ int main(
             return EXIT_FAILURE;
         }
 
+        std::cout
+            << "\nBenchmarking M14 FP16-storage / FP32-accumulation path...\n";
+
+        const MixedPrecisionComparison mixed =
+            benchmarkMixedPrecision(
+                gpuIndex,
+                allQueries,
+                best.batchSize,
+                dimension,
+                topK
+            );
+
+        const double fp32Qps =
+            static_cast<double>(
+                mixed.queryCount
+            ) *
+            1000.0 /
+            mixed.fp32TotalStats.p50;
+
+        const double fp16Qps =
+            static_cast<double>(
+                mixed.queryCount
+            ) *
+            1000.0 /
+            mixed.fp16TotalStats.p50;
+
+        const double m14Gain =
+            mixed.fp32TotalStats.p50 /
+            mixed.fp16TotalStats.p50;
+
+        const double memoryReduction =
+            1.0 -
+            static_cast<double>(
+                gpuIndex.fp16IndexBytes()
+            ) /
+            static_cast<double>(
+                gpuIndex.indexBytes()
+            );
+
+        const bool m14RecallPass =
+            mixed.recallAtK >=
+            MIN_M14_RECALL_AT_K;
+
+        std::cout
+            << "\n============================================\n"
+            << "       M14 Mixed-Precision Results\n"
+            << "============================================\n"
+            << "Queries per batch:           "
+            << mixed.queryCount
+            << '\n'
+            << "Selected query tile:         "
+            << mixed.queryTileSize
+            << '\n'
+            << "Database storage:            FP16\n"
+            << "Distance accumulation:       FP32\n"
+            << "Packed half2 loads:          "
+            << (
+                mixed.half2LoadsUsed
+                    ? "yes"
+                    : "no - scalar FP16 fallback"
+            )
+            << '\n'
+            << "FP32 logical index:          "
+            << static_cast<double>(
+                gpuIndex.indexBytes()
+            ) /
+            (1024.0 * 1024.0)
+            << " MiB\n"
+            << "FP16 logical index:          "
+            << static_cast<double>(
+                gpuIndex.fp16IndexBytes()
+            ) /
+            (1024.0 * 1024.0)
+            << " MiB\n"
+            << "Index memory reduction:      "
+            << memoryReduction *
+                100.0
+            << "%\n"
+            << "FP16 index build time:       "
+            << gpuIndex.fp16IndexBuildTimeMs()
+            << " ms\n"
+            << "M12 FP32 P50:                "
+            << mixed.fp32TotalStats.p50
+            << " ms\n"
+            << "M14 FP16 P50:                "
+            << mixed.fp16TotalStats.p50
+            << " ms\n"
+            << "M14 FP16 P95:                "
+            << mixed.fp16TotalStats.p95
+            << " ms\n"
+            << "M14 FP16 P99:                "
+            << mixed.fp16TotalStats.p99
+            << " ms\n"
+            << "M12 FP32 kernel P50:         "
+            << mixed.fp32KernelStats.p50
+            << " ms\n"
+            << "M14 FP16 kernel P50:         "
+            << mixed.fp16KernelStats.p50
+            << " ms\n"
+            << "M12 FP32 throughput:         "
+            << fp32Qps
+            << " queries/sec\n"
+            << "M14 FP16 throughput:         "
+            << fp16Qps
+            << " queries/sec\n"
+            << "M14 throughput gain:         "
+            << m14Gain
+            << "x\n"
+            << std::setprecision(6)
+            << "Recall@1 vs exact FP32:      "
+            << mixed.recallAt1 *
+                100.0
+            << "%\n"
+            << "Recall@K vs exact FP32:      "
+            << mixed.recallAtK *
+                100.0
+            << "%\n"
+            << "Mean matched distance error: "
+            << mixed.meanMatchedDistanceError
+            << '\n'
+            << "Max matched distance error:  "
+            << mixed.maxMatchedDistanceError
+            << '\n'
+            << "Finite FP16 distances:       "
+            << (
+                mixed.distancesFinite
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << '\n'
+            << "Recall threshold (98%):      "
+            << (
+                m14RecallPass
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << '\n'
+            << std::setprecision(3);
+
+        if (!m14RecallPass ||
+            !mixed.distancesFinite)
+        {
+            std::cerr
+                << "\nMilestone 14 mixed-precision validation failed.\n";
+
+            return EXIT_FAILURE;
+        }
+
         printFirstQueryNeighbors(
             best
                 .milestone12
@@ -2722,39 +3536,38 @@ int main(
         );
 
         std::cout
-            << "\nMilestone 13 completed successfully.\n";
+            << "\nMilestone 14 completed successfully.\n";
 
-        if (!best
-                .milestone12
-                .vectorizedLoadsUsed)
-        {
-            std::cout
-                << "The dimension is not divisible by four; "
-                << "M13 preserved the scalar query-tiled fallback "
-                << "inside the asynchronous pipeline.\n";
-        }
+        std::cout
+            << "M14 reduced logical index storage by "
+            << memoryReduction *
+                100.0
+            << "% while preserving "
+            << mixed.recallAtK *
+                100.0
+            << "% Recall@K against the exact FP32 path.\n";
 
-        if (pipelineGain >=
+        if (m14Gain >=
             1.02)
         {
             std::cout
-                << "Pinned staging and dual non-blocking CUDA streams "
-                << "produced a measurable end-to-end throughput gain.\n";
+                << "FP16 storage produced a measurable steady-state "
+                << "throughput improvement.\n";
         }
-        else if (pipelineGain >=
+        else if (m14Gain >=
             0.98)
         {
             std::cout
-                << "The dual-stream pipeline is performance-equivalent "
-                << "to sequential M12 within the benchmark noise band; "
-                << "the pipeline architecture remains validated.\n";
+                << "M14 is performance-equivalent to the FP32 baseline "
+                << "within the benchmark noise band; the 50% logical "
+                << "index-footprint reduction remains the primary gain.\n";
         }
         else
         {
             std::cout
-                << "The dual-stream pipeline is slower on this workload; "
-                << "retain sequential M12 as the latency default while "
-                << "keeping M13 for sustained multi-batch workloads.\n";
+                << "M14 trades some latency for lower index memory; "
+                << "retain the FP32 path when exact ranking/latency is "
+                << "more important than memory footprint.\n";
         }
 
         return EXIT_SUCCESS;

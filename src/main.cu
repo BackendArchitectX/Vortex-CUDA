@@ -4,6 +4,7 @@
 #include "gpu_vector_index.cuh"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -14,17 +15,37 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
 {
 
-constexpr int DEFAULT_VECTOR_COUNT = 100000;
-constexpr int DEFAULT_DIMENSION = 128;
-constexpr int DEFAULT_TOP_K = 10;
+constexpr int DEFAULT_VECTOR_COUNT =
+    100000;
 
-constexpr int WARMUP_RUNS = 5;
-constexpr int BENCHMARK_RUNS = 50;
+constexpr int DEFAULT_DIMENSION =
+    128;
+
+constexpr int DEFAULT_TOP_K =
+    10;
+
+constexpr int WARMUP_RUNS =
+    5;
+
+constexpr int BENCHMARK_RUNS =
+    50;
+
+constexpr float MAX_ALLOWED_ERROR =
+    0.001F;
+
+constexpr std::array<int, 4>
+    WARP_BLOCK_SIZES{
+        32,
+        64,
+        128,
+        256
+    };
 
 struct TimingStats
 {
@@ -37,7 +58,7 @@ struct TimingStats
 
 struct KernelBenchmark
 {
-    DistanceKernel kernel{};
+    GpuSearchConfig config{};
 
     TimingStats kernelStats;
     TimingStats totalStats;
@@ -47,10 +68,17 @@ struct KernelBenchmark
     std::vector<float> finalDistances;
 };
 
+struct CorrectnessResult
+{
+    float maxError = 0.0F;
+    bool numericPass = false;
+    bool topKMatch = false;
+};
+
 } // namespace
 
 // =========================================================
-// Dataset
+// Dataset generation
 // =========================================================
 
 std::vector<float> generateRandomData(
@@ -83,7 +111,7 @@ std::vector<float> generateRandomData(
 }
 
 // =========================================================
-// CPU exact distance reference
+// CPU exact L2 reference
 // =========================================================
 
 std::vector<float> calculateDistancesCpu(
@@ -102,7 +130,8 @@ std::vector<float> calculateDistancesCpu(
          vectorIndex < vectorCount;
          ++vectorIndex)
     {
-        float distance = 0.0F;
+        float distance =
+            0.0F;
 
         const std::size_t offset =
             static_cast<std::size_t>(
@@ -138,14 +167,15 @@ std::vector<float> calculateDistancesCpu(
             static_cast<std::size_t>(
                 vectorIndex
             )
-        ] = distance;
+        ] =
+            distance;
     }
 
     return distances;
 }
 
 // =========================================================
-// Correctness
+// Numerical correctness
 // =========================================================
 
 float calculateMaxAbsoluteError(
@@ -161,7 +191,8 @@ float calculateMaxAbsoluteError(
             >::infinity();
     }
 
-    float maxError = 0.0F;
+    float maxError =
+        0.0F;
 
     for (std::size_t index = 0;
          index < expected.size();
@@ -184,7 +215,7 @@ float calculateMaxAbsoluteError(
 }
 
 // =========================================================
-// Top-K
+// CPU Top-K reference
 // =========================================================
 
 std::vector<int> findTopK(
@@ -211,22 +242,24 @@ std::vector<int> findTopK(
         {
             const float leftDistance =
                 distances[
-                    static_cast<std::size_t>(
-                        left
-                    )
+                    static_cast<
+                        std::size_t
+                    >(left)
                 ];
 
             const float rightDistance =
                 distances[
-                    static_cast<std::size_t>(
-                        right
-                    )
+                    static_cast<
+                        std::size_t
+                    >(right)
                 ];
 
             if (leftDistance ==
                 rightDistance)
             {
-                return left < right;
+                return
+                    left <
+                    right;
             }
 
             return
@@ -256,32 +289,39 @@ double percentile(
     {
         throw std::invalid_argument(
             "Cannot calculate percentile "
-            "of empty data."
+            "from empty values."
         );
     }
 
     if (sortedValues.size() == 1)
     {
-        return sortedValues.front();
+        return
+            sortedValues.front();
     }
 
     const double position =
         percentileValue *
         static_cast<double>(
-            sortedValues.size() - 1
+            sortedValues.size() -
+            1
         );
 
     const std::size_t lowerIndex =
         static_cast<std::size_t>(
-            std::floor(position)
+            std::floor(
+                position
+            )
         );
 
     const std::size_t upperIndex =
         static_cast<std::size_t>(
-            std::ceil(position)
+            std::ceil(
+                position
+            )
         );
 
-    if (lowerIndex == upperIndex)
+    if (lowerIndex ==
+        upperIndex)
     {
         return
             sortedValues[
@@ -296,11 +336,17 @@ double percentile(
         );
 
     return
-        sortedValues[lowerIndex] +
+        sortedValues[
+            lowerIndex
+        ] +
         fraction *
         (
-            sortedValues[upperIndex] -
-            sortedValues[lowerIndex]
+            sortedValues[
+                upperIndex
+            ] -
+            sortedValues[
+                lowerIndex
+            ]
         );
 }
 
@@ -357,7 +403,7 @@ TimingStats calculateStats(
 }
 
 // =========================================================
-// Kernel naming
+// Kernel names
 // =========================================================
 
 const char* kernelName(
@@ -377,23 +423,30 @@ const char* kernelName(
 }
 
 // =========================================================
-// Benchmark one kernel
+// Benchmark one launch configuration
 // =========================================================
 
 KernelBenchmark benchmarkKernel(
     GpuVectorIndex& index,
     const std::vector<float>& query,
-    const DistanceKernel kernel)
+    const GpuSearchConfig& config)
 {
     index.warmUp(
-        kernel,
+        config,
         WARMUP_RUNS
     );
 
-    std::vector<double> kernelTimes;
-    std::vector<double> totalTimes;
-    std::vector<double> uploadTimes;
-    std::vector<double> downloadTimes;
+    std::vector<double>
+        kernelTimes;
+
+    std::vector<double>
+        totalTimes;
+
+    std::vector<double>
+        uploadTimes;
+
+    std::vector<double>
+        downloadTimes;
 
     kernelTimes.reserve(
         BENCHMARK_RUNS
@@ -411,7 +464,8 @@ KernelBenchmark benchmarkKernel(
         BENCHMARK_RUNS
     );
 
-    std::vector<float> finalDistances;
+    std::vector<float>
+        finalDistances;
 
     for (int run = 0;
          run < BENCHMARK_RUNS;
@@ -420,7 +474,7 @@ KernelBenchmark benchmarkKernel(
         GpuSearchResult result =
             index.search(
                 query,
-                kernel
+                config
             );
 
         kernelTimes.push_back(
@@ -453,8 +507,8 @@ KernelBenchmark benchmarkKernel(
 
     KernelBenchmark benchmark;
 
-    benchmark.kernel =
-        kernel;
+    benchmark.config =
+        config;
 
     benchmark.kernelStats =
         calculateStats(
@@ -485,7 +539,46 @@ KernelBenchmark benchmarkKernel(
 }
 
 // =========================================================
-// Print benchmark statistics
+// Correctness evaluation
+// =========================================================
+
+CorrectnessResult evaluateCorrectness(
+    const std::vector<float>& cpuDistances,
+    const std::vector<int>& cpuTopK,
+    const std::vector<float>& gpuDistances,
+    const int topK)
+{
+    CorrectnessResult result;
+
+    result.maxError =
+        calculateMaxAbsoluteError(
+            cpuDistances,
+            gpuDistances
+        );
+
+    result.numericPass =
+        std::isfinite(
+            result.maxError
+        ) &&
+        result.maxError <=
+            MAX_ALLOWED_ERROR;
+
+    const std::vector<int>
+        gpuTopK =
+            findTopK(
+                gpuDistances,
+                topK
+            );
+
+    result.topKMatch =
+        cpuTopK ==
+        gpuTopK;
+
+    return result;
+}
+
+// =========================================================
+// Print timing statistics
 // =========================================================
 
 void printStats(
@@ -522,15 +615,21 @@ void printStats(
         << " ms\n";
 }
 
+// =========================================================
+// Print one kernel benchmark
+// =========================================================
+
 void printKernelBenchmark(
     const KernelBenchmark& benchmark)
 {
     std::cout
         << "\n"
         << kernelName(
-            benchmark.kernel
+            benchmark.config.kernel
         )
-        << " Kernel\n";
+        << " / "
+        << benchmark.config.blockSize
+        << " threads\n";
 
     std::cout
         << "------------------------------------\n";
@@ -540,7 +639,8 @@ void printKernelBenchmark(
         benchmark.kernelStats
     );
 
-    std::cout << '\n';
+    std::cout
+        << '\n';
 
     printStats(
         "End-to-end query latency",
@@ -576,6 +676,10 @@ int main(
         int topK =
             DEFAULT_TOP_K;
 
+        // -------------------------------------------------
+        // CLI
+        // -------------------------------------------------
+
         if (argc >= 2)
         {
             vectorCount =
@@ -606,16 +710,21 @@ int main(
             topK > vectorCount)
         {
             std::cerr
-                << "Invalid arguments.\n";
+                << "Invalid arguments.\n"
+                << "Usage: vortex_cuda "
+                << "[vectorCount] "
+                << "[dimension] "
+                << "[topK]\n";
 
             return EXIT_FAILURE;
         }
 
         // -------------------------------------------------
-        // CUDA device
+        // CUDA device discovery
         // -------------------------------------------------
 
-        int deviceCount = 0;
+        int deviceCount =
+            0;
 
         CUDA_CHECK(
             cudaGetDeviceCount(
@@ -640,10 +749,14 @@ int main(
             )
         );
 
+        // -------------------------------------------------
+        // Header
+        // -------------------------------------------------
+
         std::cout
-            << "====================================\n"
-            << "      Vortex CUDA Benchmark\n"
-            << "====================================\n\n";
+            << "============================================\n"
+            << "       Vortex CUDA Launch Autotuner\n"
+            << "============================================\n\n";
 
         std::cout
             << "GPU: "
@@ -675,12 +788,12 @@ int main(
             << '\n';
 
         std::cout
-            << "Warm-up runs: "
+            << "Warm-up runs/config: "
             << WARMUP_RUNS
             << '\n';
 
         std::cout
-            << "Benchmark runs: "
+            << "Benchmark runs/config: "
             << BENCHMARK_RUNS
             << "\n\n";
 
@@ -688,30 +801,33 @@ int main(
         // Dataset
         // -------------------------------------------------
 
-        const std::size_t databaseElements =
-            static_cast<std::size_t>(
-                vectorCount
-            ) *
-            static_cast<std::size_t>(
-                dimension
-            );
+        const std::size_t
+            databaseElements =
+                static_cast<std::size_t>(
+                    vectorCount
+                ) *
+                static_cast<std::size_t>(
+                    dimension
+                );
 
         std::cout
             << "Generating deterministic dataset...\n";
 
-        const std::vector<float> database =
-            generateRandomData(
-                databaseElements,
-                42
-            );
+        const std::vector<float>
+            database =
+                generateRandomData(
+                    databaseElements,
+                    42
+                );
 
-        const std::vector<float> query =
-            generateRandomData(
-                static_cast<std::size_t>(
-                    dimension
-                ),
-                1337
-            );
+        const std::vector<float>
+            query =
+                generateRandomData(
+                    static_cast<std::size_t>(
+                        dimension
+                    ),
+                    1337
+                );
 
         // -------------------------------------------------
         // CPU reference
@@ -723,13 +839,14 @@ int main(
         const auto cpuStart =
             std::chrono::steady_clock::now();
 
-        const std::vector<float> cpuDistances =
-            calculateDistancesCpu(
-                database,
-                query,
-                vectorCount,
-                dimension
-            );
+        const std::vector<float>
+            cpuDistances =
+                calculateDistancesCpu(
+                    database,
+                    query,
+                    vectorCount,
+                    dimension
+                );
 
         const auto cpuEnd =
             std::chrono::steady_clock::now();
@@ -743,8 +860,15 @@ int main(
                 cpuStart
             ).count();
 
+        const std::vector<int>
+            cpuTopK =
+                findTopK(
+                    cpuDistances,
+                    topK
+                );
+
         // -------------------------------------------------
-        // Persistent index
+        // Persistent GPU index
         // -------------------------------------------------
 
         std::cout
@@ -777,89 +901,171 @@ int main(
             << " ms\n";
 
         // -------------------------------------------------
-        // Shared-memory benchmark
+        // Historical shared-memory baseline
         // -------------------------------------------------
+
+        const GpuSearchConfig
+            sharedConfig{
+                DistanceKernel::SharedMemory,
+                256
+            };
 
         std::cout
-            << "\nBenchmarking shared-memory kernel...\n";
+            << "\nBenchmarking shared-memory "
+            << "256-thread baseline...\n";
 
-        const KernelBenchmark sharedBenchmark =
-            benchmarkKernel(
-                gpuIndex,
-                query,
-                DistanceKernel::SharedMemory
-            );
+        const KernelBenchmark
+            sharedBenchmark =
+                benchmarkKernel(
+                    gpuIndex,
+                    query,
+                    sharedConfig
+                );
 
         // -------------------------------------------------
-        // Warp-shuffle benchmark
+        // Warp block-size autotuning
         // -------------------------------------------------
 
-        std::cout
-            << "Benchmarking warp-shuffle kernel...\n";
+        std::vector<KernelBenchmark>
+            warpBenchmarks;
 
-        const KernelBenchmark warpBenchmark =
-            benchmarkKernel(
-                gpuIndex,
-                query,
-                DistanceKernel::WarpShuffle
+        warpBenchmarks.reserve(
+            WARP_BLOCK_SIZES.size()
+        );
+
+        for (const int blockSize :
+             WARP_BLOCK_SIZES)
+        {
+            std::cout
+                << "Benchmarking warp-shuffle "
+                << blockSize
+                << "-thread configuration...\n";
+
+            const GpuSearchConfig
+                config{
+                    DistanceKernel::WarpShuffle,
+                    blockSize
+                };
+
+            warpBenchmarks.push_back(
+                benchmarkKernel(
+                    gpuIndex,
+                    query,
+                    config
+                )
             );
+        }
+
+        // -------------------------------------------------
+        // Select lowest kernel P50
+        // -------------------------------------------------
+
+        const auto bestIterator =
+            std::min_element(
+                warpBenchmarks.begin(),
+                warpBenchmarks.end(),
+                [](
+                    const KernelBenchmark& left,
+                    const KernelBenchmark& right)
+                {
+                    return
+                        left.kernelStats.p50 <
+                        right.kernelStats.p50;
+                }
+            );
+
+        if (bestIterator ==
+            warpBenchmarks.end())
+        {
+            throw std::runtime_error(
+                "No warp benchmark result available."
+            );
+        }
+
+        const KernelBenchmark&
+            bestWarpBenchmark =
+                *bestIterator;
+
+        const auto warp256Iterator =
+            std::find_if(
+                warpBenchmarks.begin(),
+                warpBenchmarks.end(),
+                [](
+                    const KernelBenchmark& benchmark)
+                {
+                    return
+                        benchmark.config.blockSize ==
+                        256;
+                }
+            );
+
+        if (warp256Iterator ==
+            warpBenchmarks.end())
+        {
+            throw std::runtime_error(
+                "256-thread warp baseline missing."
+            );
+        }
+
+        const KernelBenchmark&
+            warp256Benchmark =
+                *warp256Iterator;
 
         // -------------------------------------------------
         // Correctness
         // -------------------------------------------------
 
-        const float sharedError =
-            calculateMaxAbsoluteError(
-                cpuDistances,
-                sharedBenchmark.finalDistances
+        const CorrectnessResult
+            sharedCorrectness =
+                evaluateCorrectness(
+                    cpuDistances,
+                    cpuTopK,
+                    sharedBenchmark.finalDistances,
+                    topK
+                );
+
+        std::vector<CorrectnessResult>
+            warpCorrectness;
+
+        warpCorrectness.reserve(
+            warpBenchmarks.size()
+        );
+
+        bool allCorrect =
+            sharedCorrectness.numericPass &&
+            sharedCorrectness.topKMatch;
+
+        for (const KernelBenchmark&
+             benchmark :
+             warpBenchmarks)
+        {
+            const CorrectnessResult
+                correctness =
+                    evaluateCorrectness(
+                        cpuDistances,
+                        cpuTopK,
+                        benchmark.finalDistances,
+                        topK
+                    );
+
+            warpCorrectness.push_back(
+                correctness
             );
 
-        const float warpError =
-            calculateMaxAbsoluteError(
-                cpuDistances,
-                warpBenchmark.finalDistances
-            );
-
-        const float kernelDifference =
-            calculateMaxAbsoluteError(
-                sharedBenchmark.finalDistances,
-                warpBenchmark.finalDistances
-            );
-
-        const std::vector<int> cpuTopK =
-            findTopK(
-                cpuDistances,
-                topK
-            );
-
-        const std::vector<int> sharedTopK =
-            findTopK(
-                sharedBenchmark.finalDistances,
-                topK
-            );
-
-        const std::vector<int> warpTopK =
-            findTopK(
-                warpBenchmark.finalDistances,
-                topK
-            );
-
-        const bool sharedTopKMatches =
-            cpuTopK ==
-            sharedTopK;
-
-        const bool warpTopKMatches =
-            cpuTopK ==
-            warpTopK;
+            allCorrect =
+                allCorrect &&
+                correctness.numericPass &&
+                correctness.topKMatch;
+        }
 
         // -------------------------------------------------
-        // Results
+        // Benchmark output
         // -------------------------------------------------
 
         std::cout
-            << "\n\n====================================\n"
-            << "           Benchmark Results\n"
-            << "====================================\n";
+            << "\n\n============================================\n"
+            << "              Benchmark Results\n"
+            << "============================================\n";
 
         std::cout
             << "\nCPU reference\n"
@@ -872,100 +1078,183 @@ int main(
             sharedBenchmark
         );
 
-        printKernelBenchmark(
-            warpBenchmark
-        );
+        for (const KernelBenchmark&
+             benchmark :
+             warpBenchmarks)
+        {
+            printKernelBenchmark(
+                benchmark
+            );
+        }
 
         // -------------------------------------------------
-        // A/B improvement
+        // Block-size comparison table
         // -------------------------------------------------
 
         std::cout
-            << "\nA/B Improvement\n"
-            << "------------------------------------\n";
+            << "\nWarp Block-Size Comparison\n"
+            << "--------------------------------------------\n"
+            << "Threads     Kernel P50     P95       Query P50\n";
 
-        const double kernelP50Speedup =
-            sharedBenchmark.kernelStats.p50 /
-            warpBenchmark.kernelStats.p50;
+        for (const KernelBenchmark&
+             benchmark :
+             warpBenchmarks)
+        {
+            std::cout
+                << std::setw(7)
+                << benchmark.config.blockSize
+                << "     "
+                << std::setw(10)
+                << benchmark.kernelStats.p50
+                << "     "
+                << std::setw(7)
+                << benchmark.kernelStats.p95
+                << "     "
+                << std::setw(9)
+                << benchmark.totalStats.p50
+                << '\n';
+        }
 
-        const double kernelP95Speedup =
-            sharedBenchmark.kernelStats.p95 /
-            warpBenchmark.kernelStats.p95;
+        // -------------------------------------------------
+        // Autotuner result
+        // -------------------------------------------------
 
-        const double queryP50Speedup =
-            sharedBenchmark.totalStats.p50 /
-            warpBenchmark.totalStats.p50;
+        const double
+            vsWarp256KernelSpeedup =
+                warp256Benchmark.kernelStats.p50 /
+                bestWarpBenchmark.kernelStats.p50;
 
-        const double cpuVsWarpP50 =
-            cpuTimeMs /
-            warpBenchmark.totalStats.p50;
+        const double
+            vsWarp256QuerySpeedup =
+                warp256Benchmark.totalStats.p50 /
+                bestWarpBenchmark.totalStats.p50;
+
+        const double
+            vsSharedKernelSpeedup =
+                sharedBenchmark.kernelStats.p50 /
+                bestWarpBenchmark.kernelStats.p50;
+
+        const double
+            cpuVsBestQuerySpeedup =
+                cpuTimeMs /
+                bestWarpBenchmark.totalStats.p50;
 
         std::cout
-            << "Warp vs Shared kernel P50: "
-            << kernelP50Speedup
+            << "\nAutotuned Selection\n"
+            << "--------------------------------------------\n";
+
+        std::cout
+            << "Vector dimension:          "
+            << dimension
+            << '\n';
+
+        std::cout
+            << "Selected block size:       "
+            << bestWarpBenchmark.config.blockSize
+            << " threads\n";
+
+        std::cout
+            << "Selection metric:          "
+            << "lowest kernel P50\n";
+
+        std::cout
+            << "Selected kernel P50:       "
+            << bestWarpBenchmark.kernelStats.p50
+            << " ms\n";
+
+        std::cout
+            << "Selected kernel P95:       "
+            << bestWarpBenchmark.kernelStats.p95
+            << " ms\n";
+
+        std::cout
+            << "Selected query P50:        "
+            << bestWarpBenchmark.totalStats.p50
+            << " ms\n";
+
+        std::cout
+            << "vs Warp-256 kernel P50:    "
+            << vsWarp256KernelSpeedup
             << "x\n";
 
         std::cout
-            << "Warp vs Shared kernel P95: "
-            << kernelP95Speedup
+            << "vs Warp-256 query P50:     "
+            << vsWarp256QuerySpeedup
             << "x\n";
 
         std::cout
-            << "Warp vs Shared query P50:  "
-            << queryP50Speedup
+            << "vs Shared-256 kernel P50:  "
+            << vsSharedKernelSpeedup
             << "x\n";
 
         std::cout
-            << "CPU vs Warp query P50:     "
-            << cpuVsWarpP50
+            << "CPU vs selected query P50: "
+            << cpuVsBestQuerySpeedup
             << "x\n";
 
         // -------------------------------------------------
-        // Correctness output
+        // Correctness table
         // -------------------------------------------------
 
         std::cout
             << "\nCorrectness\n"
-            << "------------------------------------\n";
+            << "--------------------------------------------\n";
 
         std::cout
             << std::setprecision(8);
 
         std::cout
-            << "Shared max error:     "
-            << sharedError
-            << '\n';
-
-        std::cout
-            << "Warp max error:       "
-            << warpError
-            << '\n';
-
-        std::cout
-            << "Shared/Warp delta:    "
-            << kernelDifference
-            << '\n';
-
-        std::cout
-            << "Shared Top-K match:   "
+            << "Shared-256"
+            << "  error="
+            << sharedCorrectness.maxError
+            << "  numeric="
             << (
-                sharedTopKMatches
-                    ? "YES"
-                    : "NO"
+                sharedCorrectness.numericPass
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << "  topK="
+            << (
+                sharedCorrectness.topKMatch
+                    ? "PASS"
+                    : "FAIL"
             )
             << '\n';
 
-        std::cout
-            << "Warp Top-K match:     "
-            << (
-                warpTopKMatches
-                    ? "YES"
-                    : "NO"
-            )
-            << '\n';
+        for (std::size_t index = 0;
+             index < warpBenchmarks.size();
+             ++index)
+        {
+            std::cout
+                << "Warp-"
+                << std::setw(3)
+                << warpBenchmarks[
+                    index
+                ].config.blockSize
+                << "    error="
+                << warpCorrectness[
+                    index
+                ].maxError
+                << "  numeric="
+                << (
+                    warpCorrectness[
+                        index
+                    ].numericPass
+                        ? "PASS"
+                        : "FAIL"
+                )
+                << "  topK="
+                << (
+                    warpCorrectness[
+                        index
+                    ].topKMatch
+                        ? "PASS"
+                        : "FAIL"
+                )
+                << '\n';
+        }
 
-        if (!sharedTopKMatches ||
-            !warpTopKMatches)
+        if (!allCorrect)
         {
             std::cerr
                 << "\nCorrectness validation failed.\n";
@@ -974,7 +1263,7 @@ int main(
         }
 
         std::cout
-            << "\nMilestone 3 completed successfully.\n";
+            << "\nMilestone 4 completed successfully.\n";
 
         return EXIT_SUCCESS;
     }

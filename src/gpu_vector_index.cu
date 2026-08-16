@@ -13,14 +13,11 @@
 namespace
 {
 
-constexpr int CUDA_BLOCK_SIZE = 256;
 constexpr int CUDA_WARP_SIZE = 32;
-constexpr int WARPS_PER_BLOCK =
-    CUDA_BLOCK_SIZE / CUDA_WARP_SIZE;
 
-// ---------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------
+// =========================================================
+// Validation
+// =========================================================
 
 std::size_t requirePositive(
     const int value,
@@ -67,9 +64,11 @@ std::size_t validateDatabase(
     }
 
     const std::size_t expectedElements =
-        vectors * dimensions;
+        vectors *
+        dimensions;
 
-    if (database.size() != expectedElements)
+    if (database.size() !=
+        expectedElements)
     {
         throw std::invalid_argument(
             "Database size does not match "
@@ -83,11 +82,12 @@ std::size_t validateDatabase(
 } // namespace
 
 // =========================================================
-// Device reduction helper
+// Warp reduction
 // =========================================================
 
 __inline__ __device__
-float warpReduceSum(float value)
+float warpReduceSum(
+    float value)
 {
     constexpr unsigned int FULL_MASK =
         0xFFFFFFFFU;
@@ -110,8 +110,13 @@ float warpReduceSum(float value)
 
 // =========================================================
 // V1 — Shared-memory reduction
+//
+// Templated so the implementation remains valid for
+// different block sizes, although Milestone 4 keeps the
+// 256-thread version as the historical baseline.
 // =========================================================
 
+template <int BLOCK_SIZE>
 __global__ void l2DistanceSharedKernel(
     const float* __restrict__ database,
     const float* __restrict__ query,
@@ -124,7 +129,8 @@ __global__ void l2DistanceSharedKernel(
             blockIdx.x
         );
 
-    if (vectorIndex >= vectorCount)
+    if (vectorIndex >=
+        vectorCount)
     {
         return;
     }
@@ -149,9 +155,7 @@ __global__ void l2DistanceSharedKernel(
 
     for (int d = threadId;
          d < dimension;
-         d += static_cast<int>(
-             blockDim.x
-         ))
+         d += BLOCK_SIZE)
     {
         const float difference =
             vector[d] -
@@ -168,13 +172,15 @@ __global__ void l2DistanceSharedKernel(
     __syncthreads();
 
     for (unsigned int stride =
-             blockDim.x / 2;
+             BLOCK_SIZE / 2;
          stride > 0;
          stride >>= 1)
     {
         if (threadIdx.x < stride)
         {
-            partial[threadIdx.x] +=
+            partial[
+                threadIdx.x
+            ] +=
                 partial[
                     threadIdx.x +
                     stride
@@ -186,15 +192,26 @@ __global__ void l2DistanceSharedKernel(
 
     if (threadIdx.x == 0)
     {
-        distances[vectorIndex] =
+        distances[
+            vectorIndex
+        ] =
             partial[0];
     }
 }
 
 // =========================================================
 // V2 — Warp-shuffle reduction
+//
+// BLOCK_SIZE is compile-time specialized.
+//
+// Supported:
+//   32
+//   64
+//   128
+//   256
 // =========================================================
 
+template <int BLOCK_SIZE>
 __global__ void l2DistanceWarpKernel(
     const float* __restrict__ database,
     const float* __restrict__ query,
@@ -202,12 +219,17 @@ __global__ void l2DistanceWarpKernel(
     const int vectorCount,
     const int dimension)
 {
+    constexpr int WARPS_PER_BLOCK =
+        BLOCK_SIZE /
+        CUDA_WARP_SIZE;
+
     const int vectorIndex =
         static_cast<int>(
             blockIdx.x
         );
 
-    if (vectorIndex >= vectorCount)
+    if (vectorIndex >=
+        vectorCount)
     {
         return;
     }
@@ -240,11 +262,13 @@ __global__ void l2DistanceWarpKernel(
 
     float localSum = 0.0F;
 
+    // -----------------------------------------------------
+    // Each thread processes zero or more dimensions.
+    // -----------------------------------------------------
+
     for (int d = threadId;
          d < dimension;
-         d += static_cast<int>(
-             blockDim.x
-         ))
+         d += BLOCK_SIZE)
     {
         const float difference =
             vector[d] -
@@ -255,33 +279,40 @@ __global__ void l2DistanceWarpKernel(
             difference;
     }
 
-    // First-stage reduction happens completely
-    // inside each warp.
+    // -----------------------------------------------------
+    // Stage 1:
+    // Reduce inside each warp.
+    // -----------------------------------------------------
+
     localSum =
         warpReduceSum(
             localSum
         );
 
-    // Lane zero writes one value per warp.
     if (laneId == 0)
     {
-        warpSums[warpId] =
+        warpSums[
+            warpId
+        ] =
             localSum;
     }
 
     __syncthreads();
 
-    // Only the first warp performs the
-    // final block-level reduction.
+    // -----------------------------------------------------
+    // Stage 2:
+    // First warp reduces all per-warp sums.
+    // -----------------------------------------------------
+
     if (warpId == 0)
     {
-        float blockSum = 0.0F;
-
-        if (laneId < WARPS_PER_BLOCK)
-        {
-            blockSum =
-                warpSums[laneId];
-        }
+        float blockSum =
+            laneId <
+            WARPS_PER_BLOCK
+                ? warpSums[
+                    laneId
+                ]
+                : 0.0F;
 
         blockSum =
             warpReduceSum(
@@ -290,11 +321,199 @@ __global__ void l2DistanceWarpKernel(
 
         if (laneId == 0)
         {
-            distances[vectorIndex] =
+            distances[
+                vectorIndex
+            ] =
                 blockSum;
         }
     }
 }
+
+// =========================================================
+// Launch helpers
+// =========================================================
+
+namespace
+{
+
+template <int BLOCK_SIZE>
+void launchSharedKernel(
+    const float* database,
+    const float* query,
+    float* distances,
+    const int vectorCount,
+    const int dimension)
+{
+    constexpr std::size_t
+        SHARED_MEMORY_BYTES =
+            static_cast<std::size_t>(
+                BLOCK_SIZE
+            ) *
+            sizeof(float);
+
+    l2DistanceSharedKernel<
+        BLOCK_SIZE
+    ><<<
+        vectorCount,
+        BLOCK_SIZE,
+        SHARED_MEMORY_BYTES
+    >>>(
+        database,
+        query,
+        distances,
+        vectorCount,
+        dimension
+    );
+}
+
+template <int BLOCK_SIZE>
+void launchWarpKernel(
+    const float* database,
+    const float* query,
+    float* distances,
+    const int vectorCount,
+    const int dimension)
+{
+    l2DistanceWarpKernel<
+        BLOCK_SIZE
+    ><<<
+        vectorCount,
+        BLOCK_SIZE
+    >>>(
+        database,
+        query,
+        distances,
+        vectorCount,
+        dimension
+    );
+}
+
+void launchConfiguredKernel(
+    const GpuSearchConfig& config,
+    const float* database,
+    const float* query,
+    float* distances,
+    const int vectorCount,
+    const int dimension)
+{
+    switch (config.kernel)
+    {
+        case DistanceKernel::SharedMemory:
+        {
+            switch (config.blockSize)
+            {
+                case 32:
+                    launchSharedKernel<32>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                case 64:
+                    launchSharedKernel<64>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                case 128:
+                    launchSharedKernel<128>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                case 256:
+                    launchSharedKernel<256>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                default:
+                    throw std::invalid_argument(
+                        "Unsupported shared-memory "
+                        "block size."
+                    );
+            }
+
+            break;
+        }
+
+        case DistanceKernel::WarpShuffle:
+        {
+            switch (config.blockSize)
+            {
+                case 32:
+                    launchWarpKernel<32>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                case 64:
+                    launchWarpKernel<64>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                case 128:
+                    launchWarpKernel<128>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                case 256:
+                    launchWarpKernel<256>(
+                        database,
+                        query,
+                        distances,
+                        vectorCount,
+                        dimension
+                    );
+                    break;
+
+                default:
+                    throw std::invalid_argument(
+                        "Unsupported warp-shuffle "
+                        "block size."
+                    );
+            }
+
+            break;
+        }
+
+        default:
+            throw std::invalid_argument(
+                "Unknown distance kernel."
+            );
+    }
+}
+
+} // namespace
 
 // =========================================================
 // Constructor
@@ -343,7 +562,7 @@ GpuVectorIndex::GpuVectorIndex(
     );
 
     // -----------------------------------------------------
-    // Upload database once
+    // Upload the vector database only once.
     // -----------------------------------------------------
 
     const std::size_t elementCount =
@@ -402,12 +621,26 @@ GpuVectorIndex::~GpuVectorIndex()
 }
 
 // =========================================================
+// Block-size validation
+// =========================================================
+
+bool GpuVectorIndex::isSupportedBlockSize(
+    const int blockSize) noexcept
+{
+    return
+        blockSize == 32 ||
+        blockSize == 64 ||
+        blockSize == 128 ||
+        blockSize == 256;
+}
+
+// =========================================================
 // Search
 // =========================================================
 
 GpuSearchResult GpuVectorIndex::search(
     const std::vector<float>& query,
-    const DistanceKernel kernel)
+    const GpuSearchConfig& config)
 {
     if (query.size() !=
         static_cast<std::size_t>(
@@ -417,6 +650,17 @@ GpuSearchResult GpuVectorIndex::search(
         throw std::invalid_argument(
             "Query dimension does not match "
             "index dimension."
+        );
+    }
+
+    if (!isSupportedBlockSize(
+            config.blockSize
+        ))
+    {
+        throw std::invalid_argument(
+            "Unsupported CUDA block size. "
+            "Supported sizes are "
+            "32, 64, 128 and 256."
         );
     }
 
@@ -472,54 +716,14 @@ GpuSearchResult GpuVectorIndex::search(
         )
     );
 
-    switch (kernel)
-    {
-        case DistanceKernel::SharedMemory:
-        {
-            const std::size_t sharedMemoryBytes =
-                static_cast<std::size_t>(
-                    CUDA_BLOCK_SIZE
-                ) *
-                sizeof(float);
-
-            l2DistanceSharedKernel<<<
-                vectorCount_,
-                CUDA_BLOCK_SIZE,
-                sharedMemoryBytes
-            >>>(
-                deviceDatabase_.data(),
-                deviceQuery_.data(),
-                deviceDistances_.data(),
-                vectorCount_,
-                dimension_
-            );
-
-            break;
-        }
-
-        case DistanceKernel::WarpShuffle:
-        {
-            l2DistanceWarpKernel<<<
-                vectorCount_,
-                CUDA_BLOCK_SIZE
-            >>>(
-                deviceDatabase_.data(),
-                deviceQuery_.data(),
-                deviceDistances_.data(),
-                vectorCount_,
-                dimension_
-            );
-
-            break;
-        }
-
-        default:
-        {
-            throw std::invalid_argument(
-                "Unknown distance kernel."
-            );
-        }
-    }
+    launchConfiguredKernel(
+        config,
+        deviceDatabase_.data(),
+        deviceQuery_.data(),
+        deviceDistances_.data(),
+        vectorCount_,
+        dimension_
+    );
 
     CUDA_CHECK(
         cudaGetLastError()
@@ -546,7 +750,7 @@ GpuSearchResult GpuVectorIndex::search(
     );
 
     // -----------------------------------------------------
-    // Result download
+    // Download all distances
     // -----------------------------------------------------
 
     const auto downloadStart =
@@ -596,13 +800,22 @@ GpuSearchResult GpuVectorIndex::search(
 // =========================================================
 
 void GpuVectorIndex::warmUp(
-    const DistanceKernel kernel,
+    const GpuSearchConfig& config,
     const int iterations)
 {
     if (iterations <= 0)
     {
         throw std::invalid_argument(
             "Warm-up iterations must be positive."
+        );
+    }
+
+    if (!isSupportedBlockSize(
+            config.blockSize
+        ))
+    {
+        throw std::invalid_argument(
+            "Unsupported CUDA block size."
         );
     }
 
@@ -613,13 +826,13 @@ void GpuVectorIndex::warmUp(
         0.0F
     );
 
-    for (int i = 0;
-         i < iterations;
-         ++i)
+    for (int iteration = 0;
+         iteration < iterations;
+         ++iteration)
     {
         (void)search(
             warmupQuery,
-            kernel
+            config
         );
     }
 

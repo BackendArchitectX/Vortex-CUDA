@@ -13,6 +13,14 @@ enum class DistanceKernel
     WarpShuffle
 };
 
+struct GpuSearchConfig
+{
+    DistanceKernel kernel =
+        DistanceKernel::WarpShuffle;
+
+    int blockSize = 256;
+};
+
 struct GpuSearchResult
 {
     std::vector<float> distances;
@@ -54,13 +62,18 @@ public:
     [[nodiscard]]
     GpuSearchResult search(
         const std::vector<float>& query,
-        DistanceKernel kernel
+        const GpuSearchConfig& config
     );
 
     void warmUp(
-        DistanceKernel kernel,
+        const GpuSearchConfig& config,
         int iterations = 1
     );
+
+    [[nodiscard]]
+    static bool isSupportedBlockSize(
+        int blockSize
+    ) noexcept;
 
     [[nodiscard]]
     int vectorCount() const noexcept

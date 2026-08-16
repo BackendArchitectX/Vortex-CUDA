@@ -56,4 +56,5 @@ Makefile
 # OS files
 # ==============================
 .DS_Store
-Thumbs.db
+Thumbs.dbbenchmark_results/
+benchmark_results_full/

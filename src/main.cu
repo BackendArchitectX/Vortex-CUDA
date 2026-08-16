@@ -71,7 +71,7 @@ struct CpuBenchmark
     std::vector<Neighbor> finalNeighbors;
 };
 
-struct GpuBenchmark
+struct BaselineGpuBenchmark
 {
     TimingStats distanceStats;
     TimingStats topKStats;
@@ -82,6 +82,25 @@ struct GpuBenchmark
     std::vector<Neighbor> finalNeighbors;
 
     int topKPasses = 0;
+};
+
+struct FusedGpuBenchmark
+{
+    TimingStats fusedStats;
+    TimingStats mergeStats;
+    TimingStats totalStats;
+    TimingStats uploadStats;
+    TimingStats downloadStats;
+
+    std::vector<Neighbor> finalNeighbors;
+
+    int topKPasses = 0;
+};
+
+struct GpuComparisonBenchmark
+{
+    BaselineGpuBenchmark baseline;
+    FusedGpuBenchmark fused;
 };
 
 struct AutotuneEntry
@@ -429,7 +448,7 @@ TimingStats calculateStats(
 }
 
 // =========================================================
-// Autotune distance block size
+// Distance kernel autotuning
 // =========================================================
 
 GpuSearchConfig autotuneBlockSize(
@@ -601,144 +620,284 @@ CpuBenchmark benchmarkCpu(
 }
 
 // =========================================================
-// GPU Top-K benchmark
+// Interleaved GPU A/B benchmark
 // =========================================================
 
-GpuBenchmark benchmarkGpu(
+GpuComparisonBenchmark benchmarkGpuComparison(
     GpuVectorIndex& index,
     const std::vector<float>& query,
     const int topK,
-    const GpuSearchConfig& config)
+    const GpuSearchConfig& baselineConfig)
 {
     index.warmUpTopK(
-        config,
+        baselineConfig,
+        topK,
+        GPU_WARMUP_RUNS
+    );
+
+    index.warmUpFusedTopK(
         topK,
         GPU_WARMUP_RUNS
     );
 
     std::vector<double>
-        distanceTimes;
+        baselineDistanceTimes;
 
     std::vector<double>
-        topKTimes;
+        baselineTopKTimes;
 
     std::vector<double>
-        totalTimes;
+        baselineTotalTimes;
 
     std::vector<double>
-        uploadTimes;
+        baselineUploadTimes;
 
     std::vector<double>
-        downloadTimes;
+        baselineDownloadTimes;
 
-    distanceTimes.reserve(
+    std::vector<double>
+        fusedKernelTimes;
+
+    std::vector<double>
+        fusedMergeTimes;
+
+    std::vector<double>
+        fusedTotalTimes;
+
+    std::vector<double>
+        fusedUploadTimes;
+
+    std::vector<double>
+        fusedDownloadTimes;
+
+    baselineDistanceTimes.reserve(
         BENCHMARK_RUNS
     );
 
-    topKTimes.reserve(
+    baselineTopKTimes.reserve(
         BENCHMARK_RUNS
     );
 
-    totalTimes.reserve(
+    baselineTotalTimes.reserve(
         BENCHMARK_RUNS
     );
 
-    uploadTimes.reserve(
+    baselineUploadTimes.reserve(
         BENCHMARK_RUNS
     );
 
-    downloadTimes.reserve(
+    baselineDownloadTimes.reserve(
+        BENCHMARK_RUNS
+    );
+
+    fusedKernelTimes.reserve(
+        BENCHMARK_RUNS
+    );
+
+    fusedMergeTimes.reserve(
+        BENCHMARK_RUNS
+    );
+
+    fusedTotalTimes.reserve(
+        BENCHMARK_RUNS
+    );
+
+    fusedUploadTimes.reserve(
+        BENCHMARK_RUNS
+    );
+
+    fusedDownloadTimes.reserve(
         BENCHMARK_RUNS
     );
 
     std::vector<Neighbor>
-        finalNeighbors;
+        baselineFinalNeighbors;
 
-    int topKPasses =
+    std::vector<Neighbor>
+        fusedFinalNeighbors;
+
+    int baselinePasses =
+        0;
+
+    int fusedPasses =
         0;
 
     for (int run = 0;
          run < BENCHMARK_RUNS;
          ++run)
     {
-        GpuTopKResult result =
-            index.searchTopK(
-                query,
-                topK,
-                config
-            );
+        GpuTopKResult baselineResult;
+        GpuFusedTopKResult fusedResult;
 
-        distanceTimes.push_back(
+        // Alternate execution order to reduce
+        // systematic temperature/order bias.
+        if ((run & 1) == 0)
+        {
+            baselineResult =
+                index.searchTopK(
+                    query,
+                    topK,
+                    baselineConfig
+                );
+
+            fusedResult =
+                index.searchTopKFused(
+                    query,
+                    topK
+                );
+        }
+        else
+        {
+            fusedResult =
+                index.searchTopKFused(
+                    query,
+                    topK
+                );
+
+            baselineResult =
+                index.searchTopK(
+                    query,
+                    topK,
+                    baselineConfig
+                );
+        }
+
+        baselineDistanceTimes.push_back(
             static_cast<double>(
-                result.distanceKernelTimeMs
+                baselineResult.distanceKernelTimeMs
             )
         );
 
-        topKTimes.push_back(
+        baselineTopKTimes.push_back(
             static_cast<double>(
-                result.topKKernelTimeMs
+                baselineResult.topKKernelTimeMs
             )
         );
 
-        totalTimes.push_back(
-            result.totalTimeMs
+        baselineTotalTimes.push_back(
+            baselineResult.totalTimeMs
         );
 
-        uploadTimes.push_back(
-            result.queryUploadTimeMs
+        baselineUploadTimes.push_back(
+            baselineResult.queryUploadTimeMs
         );
 
-        downloadTimes.push_back(
-            result.resultDownloadTimeMs
+        baselineDownloadTimes.push_back(
+            baselineResult.resultDownloadTimeMs
         );
 
-        topKPasses =
-            result.topKPasses;
+        fusedKernelTimes.push_back(
+            static_cast<double>(
+                fusedResult.fusedKernelTimeMs
+            )
+        );
+
+        fusedMergeTimes.push_back(
+            static_cast<double>(
+                fusedResult.mergeKernelTimeMs
+            )
+        );
+
+        fusedTotalTimes.push_back(
+            fusedResult.totalTimeMs
+        );
+
+        fusedUploadTimes.push_back(
+            fusedResult.queryUploadTimeMs
+        );
+
+        fusedDownloadTimes.push_back(
+            fusedResult.resultDownloadTimeMs
+        );
+
+        baselinePasses =
+            baselineResult.topKPasses;
+
+        fusedPasses =
+            fusedResult.topKPasses;
 
         if (run ==
             BENCHMARK_RUNS - 1)
         {
-            finalNeighbors =
+            baselineFinalNeighbors =
                 std::move(
-                    result.neighbors
+                    baselineResult.neighbors
+                );
+
+            fusedFinalNeighbors =
+                std::move(
+                    fusedResult.neighbors
                 );
         }
     }
 
-    GpuBenchmark benchmark;
+    GpuComparisonBenchmark benchmark;
 
-    benchmark.distanceStats =
+    benchmark.baseline.distanceStats =
         calculateStats(
-            distanceTimes
+            baselineDistanceTimes
         );
 
-    benchmark.topKStats =
+    benchmark.baseline.topKStats =
         calculateStats(
-            topKTimes
+            baselineTopKTimes
         );
 
-    benchmark.totalStats =
+    benchmark.baseline.totalStats =
         calculateStats(
-            totalTimes
+            baselineTotalTimes
         );
 
-    benchmark.uploadStats =
+    benchmark.baseline.uploadStats =
         calculateStats(
-            uploadTimes
+            baselineUploadTimes
         );
 
-    benchmark.downloadStats =
+    benchmark.baseline.downloadStats =
         calculateStats(
-            downloadTimes
+            baselineDownloadTimes
         );
 
-    benchmark.finalNeighbors =
+    benchmark.baseline.finalNeighbors =
         std::move(
-            finalNeighbors
+            baselineFinalNeighbors
         );
 
-    benchmark.topKPasses =
-        topKPasses;
+    benchmark.baseline.topKPasses =
+        baselinePasses;
+
+    benchmark.fused.fusedStats =
+        calculateStats(
+            fusedKernelTimes
+        );
+
+    benchmark.fused.mergeStats =
+        calculateStats(
+            fusedMergeTimes
+        );
+
+    benchmark.fused.totalStats =
+        calculateStats(
+            fusedTotalTimes
+        );
+
+    benchmark.fused.uploadStats =
+        calculateStats(
+            fusedUploadTimes
+        );
+
+    benchmark.fused.downloadStats =
+        calculateStats(
+            fusedDownloadTimes
+        );
+
+    benchmark.fused.finalNeighbors =
+        std::move(
+            fusedFinalNeighbors
+        );
+
+    benchmark.fused.topKPasses =
+        fusedPasses;
 
     return benchmark;
 }
@@ -931,8 +1090,7 @@ int main(
                 << "[vectorCount] "
                 << "[dimension] "
                 << "[topK]\n"
-                << "Current GPU Top-K implementation "
-                << "supports K <= "
+                << "GPU Top-K supports K <= "
                 << GpuVectorIndex::MAX_TOP_K
                 << ".\n";
 
@@ -971,7 +1129,7 @@ int main(
 
         std::cout
             << "============================================\n"
-            << "       Vortex CUDA Exact GPU Top-K\n"
+            << "     Vortex CUDA Fused Exact GPU Top-K\n"
             << "============================================\n\n";
 
         std::cout
@@ -1004,9 +1162,18 @@ int main(
             << '\n';
 
         std::cout
-            << "Benchmark runs: "
+            << "Fused candidates/block: "
+            << GpuVectorIndex::
+                FUSED_CANDIDATES_PER_BLOCK
+            << '\n';
+
+        std::cout
+            << "Benchmark runs/path: "
             << BENCHMARK_RUNS
-            << "\n\n";
+            << '\n';
+
+        std::cout
+            << "A/B ordering: alternating\n\n";
 
         // -------------------------------------------------
         // Dataset
@@ -1038,7 +1205,7 @@ int main(
             );
 
         // -------------------------------------------------
-        // GPU index
+        // Persistent GPU index
         // -------------------------------------------------
 
         std::cout
@@ -1071,11 +1238,12 @@ int main(
             << " ms\n";
 
         // -------------------------------------------------
-        // Autotune distance kernel
+        // Baseline distance autotuning
         // -------------------------------------------------
 
         std::cout
-            << "\nAutotuning distance kernel...\n";
+            << "\nAutotuning Milestone 5 "
+            << "distance kernel...\n";
 
         std::vector<AutotuneEntry>
             autotuneEntries;
@@ -1109,7 +1277,7 @@ int main(
         }
 
         std::cout
-            << "\nSelected block size: "
+            << "\nBaseline selected block size: "
             << selectedConfig.blockSize
             << " threads\n";
 
@@ -1145,7 +1313,7 @@ int main(
                 );
 
         // -------------------------------------------------
-        // CPU complete search benchmark
+        // CPU benchmark
         // -------------------------------------------------
 
         std::cout
@@ -1161,72 +1329,126 @@ int main(
             );
 
         // -------------------------------------------------
-        // GPU complete search benchmark
+        // GPU A/B benchmark
         // -------------------------------------------------
 
         std::cout
-            << "Benchmarking hierarchical GPU Top-K search...\n";
+            << "Benchmarking Milestone 5 baseline vs "
+            << "Milestone 6 fused path...\n";
 
-        const GpuBenchmark gpuBenchmark =
-            benchmarkGpu(
-                gpuIndex,
-                query,
-                topK,
-                selectedConfig
-            );
+        const GpuComparisonBenchmark
+            gpuBenchmark =
+                benchmarkGpuComparison(
+                    gpuIndex,
+                    query,
+                    topK,
+                    selectedConfig
+                );
 
         // -------------------------------------------------
         // Correctness
         // -------------------------------------------------
 
-        const bool cpuGpuIndicesMatch =
+        const bool cpuBaselineMatch =
             neighborIndicesMatch(
                 cpuReference,
-                gpuBenchmark.finalNeighbors
+                gpuBenchmark
+                    .baseline
+                    .finalNeighbors
             );
 
-        const bool fullGpuIndicesMatch =
+        const bool cpuFusedMatch =
+            neighborIndicesMatch(
+                cpuReference,
+                gpuBenchmark
+                    .fused
+                    .finalNeighbors
+            );
+
+        const bool fullGpuBaselineMatch =
             neighborIndicesMatch(
                 fullGpuReference,
-                gpuBenchmark.finalNeighbors
+                gpuBenchmark
+                    .baseline
+                    .finalNeighbors
             );
 
-        const float maxDistanceError =
+        const bool fullGpuFusedMatch =
+            neighborIndicesMatch(
+                fullGpuReference,
+                gpuBenchmark
+                    .fused
+                    .finalNeighbors
+            );
+
+        const bool baselineFusedMatch =
+            neighborIndicesMatch(
+                gpuBenchmark
+                    .baseline
+                    .finalNeighbors,
+                gpuBenchmark
+                    .fused
+                    .finalNeighbors
+            );
+
+        const float baselineDistanceError =
             maxNeighborDistanceError(
                 cpuReference,
-                gpuBenchmark.finalNeighbors
+                gpuBenchmark
+                    .baseline
+                    .finalNeighbors
             );
 
-        const bool numericPass =
+        const float fusedDistanceError =
+            maxNeighborDistanceError(
+                cpuReference,
+                gpuBenchmark
+                    .fused
+                    .finalNeighbors
+            );
+
+        const bool baselineNumericPass =
             std::isfinite(
-                maxDistanceError
+                baselineDistanceError
             ) &&
-            maxDistanceError <=
+            baselineDistanceError <=
                 MAX_ALLOWED_ERROR;
 
+        const bool fusedNumericPass =
+            std::isfinite(
+                fusedDistanceError
+            ) &&
+            fusedDistanceError <=
+                MAX_ALLOWED_ERROR;
+
+        const bool allCorrect =
+            cpuBaselineMatch &&
+            cpuFusedMatch &&
+            fullGpuBaselineMatch &&
+            fullGpuFusedMatch &&
+            baselineFusedMatch &&
+            baselineNumericPass &&
+            fusedNumericPass;
+
         // -------------------------------------------------
-        // Data transfer reduction
+        // Logical intermediate-memory traffic
         // -------------------------------------------------
 
-        const std::size_t oldDownloadBytes =
+        const std::size_t distanceArrayBytes =
             static_cast<std::size_t>(
                 vectorCount
             ) *
             sizeof(float);
 
-        const std::size_t newDownloadBytes =
+        const std::size_t baselineLogicalTraffic =
+            distanceArrayBytes *
+            2;
+
+        const std::size_t resultDownloadBytes =
             static_cast<std::size_t>(
                 topK
             ) *
             sizeof(Neighbor);
-
-        const double transferReduction =
-            static_cast<double>(
-                oldDownloadBytes
-            ) /
-            static_cast<double>(
-                newDownloadBytes
-            );
 
         // -------------------------------------------------
         // Results
@@ -1237,6 +1459,10 @@ int main(
             << "              Benchmark Results\n"
             << "============================================\n";
 
+        // -------------------------------------------------
+        // CPU
+        // -------------------------------------------------
+
         std::cout
             << "\nCPU Complete Exact Search\n"
             << "--------------------------------------------\n";
@@ -1246,13 +1472,19 @@ int main(
             cpuBenchmark.totalStats
         );
 
+        // -------------------------------------------------
+        // Milestone 5
+        // -------------------------------------------------
+
         std::cout
-            << "\nGPU Complete Exact Search\n"
+            << "\nMilestone 5 GPU Baseline\n"
             << "--------------------------------------------\n";
 
         printStats(
             "Distance kernel",
-            gpuBenchmark.distanceStats
+            gpuBenchmark
+                .baseline
+                .distanceStats
         );
 
         std::cout
@@ -1260,7 +1492,9 @@ int main(
 
         printStats(
             "Hierarchical Top-K",
-            gpuBenchmark.topKStats
+            gpuBenchmark
+                .baseline
+                .topKStats
         );
 
         std::cout
@@ -1268,81 +1502,230 @@ int main(
 
         printStats(
             "End-to-end exact search",
-            gpuBenchmark.totalStats
+            gpuBenchmark
+                .baseline
+                .totalStats
         );
 
         std::cout
             << "\nTransfer P50\n"
-            << "  Query upload:    "
-            << gpuBenchmark.uploadStats.p50
+            << "  Query upload:   "
+            << gpuBenchmark
+                .baseline
+                .uploadStats
+                .p50
             << " ms\n"
-            << "  Top-K download:  "
-            << gpuBenchmark.downloadStats.p50
+            << "  Top-K download: "
+            << gpuBenchmark
+                .baseline
+                .downloadStats
+                .p50
             << " ms\n";
 
         // -------------------------------------------------
-        // Search speedup
+        // Milestone 6
         // -------------------------------------------------
 
-        const double searchP50Speedup =
-            cpuBenchmark.totalStats.p50 /
-            gpuBenchmark.totalStats.p50;
+        std::cout
+            << "\nMilestone 6 Fused GPU Search\n"
+            << "--------------------------------------------\n";
 
-        const double searchP95Speedup =
-            cpuBenchmark.totalStats.p95 /
-            gpuBenchmark.totalStats.p95;
+        printStats(
+            "Fused distance + local Top-K",
+            gpuBenchmark
+                .fused
+                .fusedStats
+        );
 
         std::cout
-            << "\nExact Search Speedup\n"
+            << '\n';
+
+        printStats(
+            "Candidate merge",
+            gpuBenchmark
+                .fused
+                .mergeStats
+        );
+
+        std::cout
+            << '\n';
+
+        printStats(
+            "End-to-end exact search",
+            gpuBenchmark
+                .fused
+                .totalStats
+        );
+
+        std::cout
+            << "\nTransfer P50\n"
+            << "  Query upload:   "
+            << gpuBenchmark
+                .fused
+                .uploadStats
+                .p50
+            << " ms\n"
+            << "  Top-K download: "
+            << gpuBenchmark
+                .fused
+                .downloadStats
+                .p50
+            << " ms\n";
+
+        // -------------------------------------------------
+        // A/B comparison
+        // -------------------------------------------------
+
+        const double fusedVsBaselineP50 =
+            gpuBenchmark
+                .baseline
+                .totalStats
+                .p50 /
+            gpuBenchmark
+                .fused
+                .totalStats
+                .p50;
+
+        const double fusedVsBaselineP95 =
+            gpuBenchmark
+                .baseline
+                .totalStats
+                .p95 /
+            gpuBenchmark
+                .fused
+                .totalStats
+                .p95;
+
+        const double cpuVsBaselineP50 =
+            cpuBenchmark
+                .totalStats
+                .p50 /
+            gpuBenchmark
+                .baseline
+                .totalStats
+                .p50;
+
+        const double cpuVsFusedP50 =
+            cpuBenchmark
+                .totalStats
+                .p50 /
+            gpuBenchmark
+                .fused
+                .totalStats
+                .p50;
+
+        const double cpuVsFusedP95 =
+            cpuBenchmark
+                .totalStats
+                .p95 /
+            gpuBenchmark
+                .fused
+                .totalStats
+                .p95;
+
+        std::cout
+            << "\nA/B Search Comparison\n"
             << "--------------------------------------------\n";
 
         std::cout
-            << "CPU P50:                 "
-            << cpuBenchmark.totalStats.p50
+            << "Baseline GPU P50:        "
+            << gpuBenchmark
+                .baseline
+                .totalStats
+                .p50
             << " ms\n";
 
         std::cout
-            << "GPU P50:                 "
-            << gpuBenchmark.totalStats.p50
+            << "Fused GPU P50:           "
+            << gpuBenchmark
+                .fused
+                .totalStats
+                .p50
             << " ms\n";
 
         std::cout
-            << "CPU vs GPU P50:          "
-            << searchP50Speedup
+            << "Baseline GPU P95:        "
+            << gpuBenchmark
+                .baseline
+                .totalStats
+                .p95
+            << " ms\n";
+
+        std::cout
+            << "Fused GPU P95:           "
+            << gpuBenchmark
+                .fused
+                .totalStats
+                .p95
+            << " ms\n";
+
+        std::cout
+            << "Fused vs baseline P50:   "
+            << fusedVsBaselineP50
             << "x\n";
 
         std::cout
-            << "CPU vs GPU P95:          "
-            << searchP95Speedup
+            << "Fused vs baseline P95:   "
+            << fusedVsBaselineP95
+            << "x\n";
+
+        std::cout
+            << "CPU vs baseline P50:     "
+            << cpuVsBaselineP50
+            << "x\n";
+
+        std::cout
+            << "CPU vs fused P50:        "
+            << cpuVsFusedP50
+            << "x\n";
+
+        std::cout
+            << "CPU vs fused P95:        "
+            << cpuVsFusedP95
             << "x\n";
 
         // -------------------------------------------------
-        // Top-K hierarchy
+        // Architecture
         // -------------------------------------------------
 
         std::cout
-            << "\nGPU Top-K Architecture\n"
+            << "\nMemory-Traffic Architecture\n"
             << "--------------------------------------------\n";
 
         std::cout
-            << "Hierarchy passes:        "
-            << gpuBenchmark.topKPasses
+            << "Full distance array:     "
+            << distanceArrayBytes
+            << " bytes\n";
+
+        std::cout
+            << "Baseline logical global\n"
+            << "distance write + read:   "
+            << baselineLogicalTraffic
+            << " bytes/query\n";
+
+        std::cout
+            << "Fused full-distance\n"
+            << "materialization:         "
+            << "0 bytes/query\n";
+
+        std::cout
+            << "Top-K result download:   "
+            << resultDownloadBytes
+            << " bytes/query\n";
+
+        std::cout
+            << "Baseline Top-K passes:   "
+            << gpuBenchmark
+                .baseline
+                .topKPasses
             << '\n';
 
         std::cout
-            << "Old result download:     "
-            << oldDownloadBytes
-            << " bytes\n";
-
-        std::cout
-            << "New Top-K download:      "
-            << newDownloadBytes
-            << " bytes\n";
-
-        std::cout
-            << "Transfer reduction:      "
-            << transferReduction
-            << "x\n";
+            << "Fused Top-K passes:      "
+            << gpuBenchmark
+                .fused
+                .topKPasses
+            << '\n';
 
         // -------------------------------------------------
         // Correctness
@@ -1356,53 +1739,109 @@ int main(
             << std::setprecision(8);
 
         std::cout
-            << "CPU vs GPU Top-K indices: "
+            << "CPU vs baseline indices: "
             << (
-                cpuGpuIndicesMatch
+                cpuBaselineMatch
                     ? "PASS"
                     : "FAIL"
             )
             << '\n';
 
         std::cout
-            << "Full GPU vs Top-K path:   "
+            << "CPU vs fused indices:    "
             << (
-                fullGpuIndicesMatch
+                cpuFusedMatch
                     ? "PASS"
                     : "FAIL"
             )
             << '\n';
 
         std::cout
-            << "Max distance error:       "
-            << maxDistanceError
+            << "Full GPU vs baseline:    "
+            << (
+                fullGpuBaselineMatch
+                    ? "PASS"
+                    : "FAIL"
+            )
             << '\n';
 
         std::cout
-            << "Numeric validation:       "
+            << "Full GPU vs fused:       "
             << (
-                numericPass
+                fullGpuFusedMatch
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << '\n';
+
+        std::cout
+            << "Baseline vs fused:       "
+            << (
+                baselineFusedMatch
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << '\n';
+
+        std::cout
+            << "Baseline max error:      "
+            << baselineDistanceError
+            << '\n';
+
+        std::cout
+            << "Fused max error:         "
+            << fusedDistanceError
+            << '\n';
+
+        std::cout
+            << "Baseline numeric:        "
+            << (
+                baselineNumericPass
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << '\n';
+
+        std::cout
+            << "Fused numeric:           "
+            << (
+                fusedNumericPass
                     ? "PASS"
                     : "FAIL"
             )
             << '\n';
 
         printNeighbors(
-            gpuBenchmark.finalNeighbors
+            gpuBenchmark
+                .fused
+                .finalNeighbors
         );
 
-        if (!cpuGpuIndicesMatch ||
-            !fullGpuIndicesMatch ||
-            !numericPass)
+        if (!allCorrect)
         {
             std::cerr
-                << "\nCorrectness validation failed.\n";
+                << "\nMilestone 6 correctness "
+                << "validation failed.\n";
 
             return EXIT_FAILURE;
         }
 
         std::cout
-            << "\nMilestone 5 completed successfully.\n";
+            << "\nMilestone 6 validation completed successfully.\n";
+
+        if (fusedVsBaselineP50 >
+            1.0)
+        {
+            std::cout
+                << "Fused path improved P50 latency.\n";
+        }
+        else
+        {
+            std::cout
+                << "Fused path did not improve P50 latency; "
+                << "retain the Milestone 5 path as the "
+                << "performance default until further tuning.\n";
+        }
 
         return EXIT_SUCCESS;
     }

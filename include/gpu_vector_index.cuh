@@ -106,6 +106,34 @@ struct GpuBatchTopKResult
 };
 
 
+
+struct GpuPipelinedTopKResult
+{
+    // Batch-major, then query-major, then rank-major:
+    //
+    // batch b / query q / rank r:
+    //   neighbors[
+    //       ((b * queryCount + q) * topK) + r
+    //   ]
+    std::vector<Neighbor> neighbors;
+
+    int batchCount = 0;
+    int queryCount = 0;
+    int topK = 0;
+
+    int streamCount = 0;
+    int queryTileSize = 1;
+
+    bool pinnedHostMemoryUsed = false;
+    bool vectorizedLoadsUsed = false;
+    bool fmaTunedKernelUsed = false;
+
+    double totalTimeMs = 0.0;
+    double averageBatchTimeMs = 0.0;
+    double amortizedQueryTimeMs = 0.0;
+    double throughputQueriesPerSecond = 0.0;
+};
+
 struct GpuQueryTileTuningResult
 {
     int selectedTileSize = 1;
@@ -126,6 +154,8 @@ public:
     static constexpr int MAX_BATCH_SIZE = 32;
 
     static constexpr int MAX_QUERY_TILE_SIZE = 4;
+
+    static constexpr int PIPELINE_STREAM_COUNT = 2;
 
     static constexpr int
         FUSED_CANDIDATES_PER_BLOCK = 256;
@@ -324,6 +354,52 @@ public:
         int iterations = 1
     );
 
+
+    // -----------------------------------------------------
+    // Milestone 13 pinned-memory + dual-stream pipeline
+    //
+    // The input contains batchCount consecutive query batches.
+    // Each query batch contains queryCount vectors.
+    //
+    // Two independent pipeline slots own:
+    //   * pinned host input/output staging buffers,
+    //   * device query/candidate buffers,
+    //   * one non-blocking CUDA stream,
+    //   * one completion event.
+    //
+    // H2D -> M12 kernel -> Top-K merge -> D2H remains ordered
+    // inside each stream, while independent batches can overlap
+    // across the two streams when the GPU supports it.
+    // -----------------------------------------------------
+
+    [[nodiscard]]
+    GpuPipelinedTopKResult
+    searchTopKBatchTiledVectorizedFmaPipelined(
+        const std::vector<float>& batchedQueries,
+        int batchCount,
+        int queryCount,
+        int topK
+    );
+
+    void warmUpTopKBatchTiledVectorizedFmaPipelined(
+        int batchCount,
+        int queryCount,
+        int topK,
+        int iterations = 1
+    );
+
+    [[nodiscard]]
+    int asyncEngineCount() const noexcept
+    {
+        return asyncEngineCount_;
+    }
+
+    [[nodiscard]]
+    bool concurrentKernelsSupported() const noexcept
+    {
+        return concurrentKernelsSupported_;
+    }
+
     [[nodiscard]]
     static bool isSupportedBlockSize(
         int blockSize
@@ -361,6 +437,9 @@ public:
     }
 
 private:
+
+
+    struct PipelineSlot;
 
 
     [[nodiscard]]
@@ -430,6 +509,15 @@ private:
             MAX_TOP_K + 1
         )
     > tunedVectorizedTileSizes_{};
+
+
+    std::array<
+        PipelineSlot*,
+        PIPELINE_STREAM_COUNT
+    > pipelineSlots_{};
+
+    int asyncEngineCount_ = 0;
+    bool concurrentKernelsSupported_ = false;
 
     cudaEvent_t distanceStart_{};
     cudaEvent_t distanceStop_{};

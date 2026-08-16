@@ -1,10 +1,12 @@
 #include "gpu_vector_index.cuh"
+#include "pinned_host_buffer.cuh"
 #include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <climits>
 #include <cstddef>
 #include <limits>
@@ -3012,6 +3014,245 @@ void launchAdaptiveFmaVectorizedQueryTiledBatchKernel(
     }
 }
 
+
+template <int QUERY_TILE_SIZE>
+void launchQueryTiledBatchKernelAsync(
+    const float* database,
+    const float* queries,
+    Neighbor* output,
+    const int vectorCount,
+    const int dimension,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery,
+    const std::size_t firstBlockCount,
+    cudaStream_t stream)
+{
+    const std::size_t queryTileCount =
+        ceilDivide(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                QUERY_TILE_SIZE
+            )
+        );
+
+    const dim3 grid(
+        static_cast<unsigned int>(
+            firstBlockCount
+        ),
+        static_cast<unsigned int>(
+            queryTileCount
+        ),
+        1U
+    );
+
+    queryTiledDistanceLocalTopKBatchKernel<
+        QUERY_TILE_SIZE
+    ><<<
+        grid,
+        TOPK_BLOCK_SIZE,
+        0,
+        stream
+    >>>(
+        database,
+        queries,
+        output,
+        vectorCount,
+        dimension,
+        queryCount,
+        topK,
+        candidateCapacityPerQuery
+    );
+}
+
+void launchAdaptiveQueryTiledBatchKernelAsync(
+    const int queryTileSize,
+    const float* database,
+    const float* queries,
+    Neighbor* output,
+    const int vectorCount,
+    const int dimension,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery,
+    const std::size_t firstBlockCount,
+    cudaStream_t stream)
+{
+    switch (queryTileSize)
+    {
+        case 1:
+            launchQueryTiledBatchKernelAsync<1>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                stream
+            );
+            break;
+
+        case 2:
+            launchQueryTiledBatchKernelAsync<2>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                stream
+            );
+            break;
+
+        case 4:
+            launchQueryTiledBatchKernelAsync<4>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                stream
+            );
+            break;
+
+        default:
+            throw std::invalid_argument(
+                "Unsupported query tile size."
+            );
+    }
+}
+
+template <int QUERY_TILE_SIZE>
+void launchFmaVectorizedQueryTiledBatchKernelAsync(
+    const float* database,
+    const float* queries,
+    Neighbor* output,
+    const int vectorCount,
+    const int dimension,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery,
+    const std::size_t firstBlockCount,
+    cudaStream_t stream)
+{
+    const std::size_t queryTileCount =
+        ceilDivide(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                QUERY_TILE_SIZE
+            )
+        );
+
+    const dim3 grid(
+        static_cast<unsigned int>(
+            firstBlockCount
+        ),
+        static_cast<unsigned int>(
+            queryTileCount
+        ),
+        1U
+    );
+
+    queryTiledFloat4FmaDistanceLocalTopKBatchKernel<
+        QUERY_TILE_SIZE
+    ><<<
+        grid,
+        TOPK_BLOCK_SIZE,
+        0,
+        stream
+    >>>(
+        database,
+        queries,
+        output,
+        vectorCount,
+        dimension,
+        queryCount,
+        topK,
+        candidateCapacityPerQuery
+    );
+}
+
+void launchAdaptiveFmaVectorizedQueryTiledBatchKernelAsync(
+    const int queryTileSize,
+    const float* database,
+    const float* queries,
+    Neighbor* output,
+    const int vectorCount,
+    const int dimension,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery,
+    const std::size_t firstBlockCount,
+    cudaStream_t stream)
+{
+    switch (queryTileSize)
+    {
+        case 1:
+            launchFmaVectorizedQueryTiledBatchKernelAsync<1>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                stream
+            );
+            break;
+
+        case 2:
+            launchFmaVectorizedQueryTiledBatchKernelAsync<2>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                stream
+            );
+            break;
+
+        case 4:
+            launchFmaVectorizedQueryTiledBatchKernelAsync<4>(
+                database,
+                queries,
+                output,
+                vectorCount,
+                dimension,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                stream
+            );
+            break;
+
+        default:
+            throw std::invalid_argument(
+                "Unsupported query tile size."
+            );
+    }
+}
+
 struct CandidateMergeResult
 {
     Neighbor* finalBuffer = nullptr;
@@ -3174,7 +3415,169 @@ mergeTopKCandidatesBatch(
     return result;
 }
 
+
+BatchCandidateMergeResult
+mergeTopKCandidatesBatchAsync(
+    Neighbor* currentBuffer,
+    Neighbor* nextBuffer,
+    std::size_t currentCountPerQuery,
+    const int queryCount,
+    const int topK,
+    const std::size_t candidateCapacityPerQuery,
+    cudaStream_t stream)
+{
+    BatchCandidateMergeResult result;
+
+    while (currentCountPerQuery >
+           static_cast<std::size_t>(
+               topK
+           ))
+    {
+        if (currentCountPerQuery >
+            static_cast<std::size_t>(
+                INT_MAX
+            ))
+        {
+            throw std::overflow_error(
+                "Batch candidate count exceeds int range."
+            );
+        }
+
+        const std::size_t blockCount =
+            ceilDivide(
+                currentCountPerQuery,
+                static_cast<std::size_t>(
+                    TOPK_BLOCK_SIZE
+                )
+            );
+
+        const dim3 grid(
+            static_cast<unsigned int>(
+                blockCount
+            ),
+            static_cast<unsigned int>(
+                queryCount
+            ),
+            1U
+        );
+
+        topKFromCandidatesBatchKernel<<<
+            grid,
+            TOPK_BLOCK_SIZE,
+            0,
+            stream
+        >>>(
+            currentBuffer,
+            nextBuffer,
+            static_cast<int>(
+                currentCountPerQuery
+            ),
+            topK,
+            candidateCapacityPerQuery
+        );
+
+        CUDA_CHECK(
+            cudaGetLastError()
+        );
+
+        currentCountPerQuery =
+            blockCount *
+            static_cast<std::size_t>(
+                topK
+            );
+
+        std::swap(
+            currentBuffer,
+            nextBuffer
+        );
+
+        ++result.mergePasses;
+    }
+
+    result.finalBuffer =
+        currentBuffer;
+
+    return result;
+}
+
 } // namespace
+
+
+struct GpuVectorIndex::PipelineSlot
+{
+    PipelineSlot(
+        const std::size_t queryCapacity,
+        const std::size_t candidateCapacity,
+        const std::size_t resultCapacity)
+        : deviceQueries(
+            queryCapacity
+        ),
+          candidateA(
+            candidateCapacity
+        ),
+          candidateB(
+            candidateCapacity
+        ),
+          hostQueries(
+            queryCapacity
+        ),
+          hostResults(
+            resultCapacity
+        )
+    {
+        CUDA_CHECK(
+            cudaStreamCreateWithFlags(
+                &stream,
+                cudaStreamNonBlocking
+            )
+        );
+
+        CUDA_CHECK(
+            cudaEventCreateWithFlags(
+                &completion,
+                cudaEventDisableTiming
+            )
+        );
+    }
+
+    ~PipelineSlot()
+    {
+        if (completion != nullptr)
+        {
+            cudaEventDestroy(
+                completion
+            );
+        }
+
+        if (stream != nullptr)
+        {
+            cudaStreamDestroy(
+                stream
+            );
+        }
+    }
+
+    PipelineSlot(
+        const PipelineSlot&
+    ) = delete;
+
+    PipelineSlot& operator=(
+        const PipelineSlot&
+    ) = delete;
+
+    DeviceBuffer<float> deviceQueries;
+    DeviceBuffer<Neighbor> candidateA;
+    DeviceBuffer<Neighbor> candidateB;
+
+    PinnedHostBuffer<float> hostQueries;
+    PinnedHostBuffer<Neighbor> hostResults;
+
+    cudaStream_t stream = nullptr;
+    cudaEvent_t completion = nullptr;
+
+    bool inFlight = false;
+    int batchIndex = -1;
+};
 
 // =========================================================
 // Constructor
@@ -3259,6 +3662,54 @@ GpuVectorIndex::GpuVectorIndex(
         )
     );
 
+    cudaDeviceProp deviceProperties{};
+
+    CUDA_CHECK(
+        cudaGetDeviceProperties(
+            &deviceProperties,
+            0
+        )
+    );
+
+    asyncEngineCount_ =
+        deviceProperties.asyncEngineCount;
+
+    concurrentKernelsSupported_ =
+        deviceProperties.concurrentKernels !=
+        0;
+
+    const std::size_t pipelineQueryCapacity =
+        calculateBatchQueryCapacity(
+            dimension_
+        );
+
+    const std::size_t pipelineCandidateCapacity =
+        calculateBatchTopKBufferCapacity(
+            vectorCount_
+        );
+
+    const std::size_t pipelineResultCapacity =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                MAX_BATCH_SIZE
+            ),
+            static_cast<std::size_t>(
+                MAX_TOP_K
+            ),
+            "Pipeline result capacity overflow."
+        );
+
+    for (auto& slot :
+         pipelineSlots_)
+    {
+        slot =
+            new PipelineSlot(
+                pipelineQueryCapacity,
+                pipelineCandidateCapacity,
+                pipelineResultCapacity
+            );
+    }
+
     const std::size_t elementCount =
         static_cast<std::size_t>(
             vectorCount_
@@ -3299,6 +3750,15 @@ GpuVectorIndex::GpuVectorIndex(
 
 GpuVectorIndex::~GpuVectorIndex()
 {
+    for (auto& slot :
+         pipelineSlots_)
+    {
+        delete slot;
+
+        slot =
+            nullptr;
+    }
+
     if (distanceStart_ != nullptr)
     {
         cudaEventDestroy(
@@ -5358,6 +5818,390 @@ GpuVectorIndex::searchTopKBatchTiledVectorizedFmaAuto(
         );
 }
 
+
+// =========================================================
+// Milestone 13 pinned-memory + dual-stream pipeline
+// =========================================================
+
+GpuPipelinedTopKResult
+GpuVectorIndex::searchTopKBatchTiledVectorizedFmaPipelined(
+    const std::vector<float>& batchedQueries,
+    const int batchCount,
+    const int queryCount,
+    const int topK)
+{
+    if (batchCount <= 0)
+    {
+        throw std::invalid_argument(
+            "batchCount must be positive."
+        );
+    }
+
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between 1 and 32."
+        );
+    }
+
+    validateTopK(
+        topK,
+        vectorCount_
+    );
+
+    const std::size_t elementsPerBatch =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                dimension_
+            ),
+            "Pipeline query batch dimensions overflow size_t."
+        );
+
+    const std::size_t expectedElements =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                batchCount
+            ),
+            elementsPerBatch,
+            "Pipeline query input size overflow."
+        );
+
+    if (batchedQueries.size() !=
+        expectedElements)
+    {
+        throw std::invalid_argument(
+            "batchedQueries.size() must equal "
+            "batchCount * queryCount * dimension."
+        );
+    }
+
+    const std::size_t neighborsPerBatch =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                queryCount
+            ),
+            static_cast<std::size_t>(
+                topK
+            ),
+            "Pipeline neighbor batch size overflow."
+        );
+
+    const std::size_t totalNeighborCount =
+        checkedMultiply(
+            static_cast<std::size_t>(
+                batchCount
+            ),
+            neighborsPerBatch,
+            "Pipeline output size overflow."
+        );
+
+    int selectedTile =
+        tunedVectorizedQueryTileSize(
+            queryCount,
+            topK
+        );
+
+    if (selectedTile == 0)
+    {
+        std::vector<float> firstBatch(
+            batchedQueries.begin(),
+            batchedQueries.begin() +
+                static_cast<
+                    std::ptrdiff_t
+                >(
+                    elementsPerBatch
+                )
+        );
+
+        const GpuQueryTileTuningResult tuning =
+            autotuneVectorizedQueryTileSize(
+                firstBatch,
+                queryCount,
+                topK
+            );
+
+        selectedTile =
+            tuning.selectedTileSize;
+    }
+
+    const bool vectorized =
+        (dimension_ % 4) == 0;
+
+    const std::size_t firstBlockCount =
+        ceilDivide(
+            static_cast<std::size_t>(
+                vectorCount_
+            ),
+            static_cast<std::size_t>(
+                FUSED_GROUP_SIZE
+            )
+        );
+
+    const std::size_t
+        candidateCapacityPerQuery =
+            calculateTopKBufferCapacity(
+                vectorCount_
+            );
+
+    const std::size_t
+        firstCandidateCountPerQuery =
+            firstBlockCount *
+            static_cast<std::size_t>(
+                topK
+            );
+
+    GpuPipelinedTopKResult result;
+
+    result.batchCount =
+        batchCount;
+
+    result.queryCount =
+        queryCount;
+
+    result.topK =
+        topK;
+
+    result.streamCount =
+        PIPELINE_STREAM_COUNT;
+
+    result.queryTileSize =
+        selectedTile;
+
+    result.pinnedHostMemoryUsed =
+        true;
+
+    result.vectorizedLoadsUsed =
+        vectorized;
+
+    result.fmaTunedKernelUsed =
+        vectorized;
+
+    result.neighbors.resize(
+        totalNeighborCount
+    );
+
+    auto retireSlot =
+        [&result,
+         neighborsPerBatch](
+            PipelineSlot& slot)
+        {
+            if (!slot.inFlight)
+            {
+                return;
+            }
+
+            CUDA_CHECK(
+                cudaEventSynchronize(
+                    slot.completion
+                )
+            );
+
+            const std::size_t destinationOffset =
+                static_cast<std::size_t>(
+                    slot.batchIndex
+                ) *
+                neighborsPerBatch;
+
+            std::memcpy(
+                result.neighbors.data() +
+                    destinationOffset,
+                slot.hostResults.data(),
+                neighborsPerBatch *
+                    sizeof(Neighbor)
+            );
+
+            slot.inFlight =
+                false;
+
+            slot.batchIndex =
+                -1;
+        };
+
+    const auto totalStart =
+        std::chrono::steady_clock::now();
+
+    for (int batchIndex = 0;
+         batchIndex <
+             batchCount;
+         ++batchIndex)
+    {
+        PipelineSlot& slot =
+            *pipelineSlots_[
+                static_cast<std::size_t>(
+                    batchIndex %
+                    PIPELINE_STREAM_COUNT
+                )
+            ];
+
+        // The slot can be reused only after its previous
+        // D2H copy has completed.
+        retireSlot(
+            slot
+        );
+
+        const std::size_t sourceOffset =
+            static_cast<std::size_t>(
+                batchIndex
+            ) *
+            elementsPerBatch;
+
+        std::memcpy(
+            slot.hostQueries.data(),
+            batchedQueries.data() +
+                sourceOffset,
+            elementsPerBatch *
+                sizeof(float)
+        );
+
+        CUDA_CHECK(
+            cudaMemcpyAsync(
+                slot.deviceQueries.data(),
+                slot.hostQueries.data(),
+                elementsPerBatch *
+                    sizeof(float),
+                cudaMemcpyHostToDevice,
+                slot.stream
+            )
+        );
+
+        if (vectorized)
+        {
+            launchAdaptiveFmaVectorizedQueryTiledBatchKernelAsync(
+                selectedTile,
+                deviceDatabase_.data(),
+                slot.deviceQueries.data(),
+                slot.candidateA.data(),
+                vectorCount_,
+                dimension_,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                slot.stream
+            );
+        }
+        else
+        {
+            launchAdaptiveQueryTiledBatchKernelAsync(
+                selectedTile,
+                deviceDatabase_.data(),
+                slot.deviceQueries.data(),
+                slot.candidateA.data(),
+                vectorCount_,
+                dimension_,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                firstBlockCount,
+                slot.stream
+            );
+        }
+
+        CUDA_CHECK(
+            cudaGetLastError()
+        );
+
+        const BatchCandidateMergeResult merge =
+            mergeTopKCandidatesBatchAsync(
+                slot.candidateA.data(),
+                slot.candidateB.data(),
+                firstCandidateCountPerQuery,
+                queryCount,
+                topK,
+                candidateCapacityPerQuery,
+                slot.stream
+            );
+
+        const std::size_t copyWidth =
+            static_cast<std::size_t>(
+                topK
+            ) *
+            sizeof(Neighbor);
+
+        const std::size_t sourcePitch =
+            candidateCapacityPerQuery *
+            sizeof(Neighbor);
+
+        CUDA_CHECK(
+            cudaMemcpy2DAsync(
+                slot.hostResults.data(),
+                copyWidth,
+                merge.finalBuffer,
+                sourcePitch,
+                copyWidth,
+                static_cast<std::size_t>(
+                    queryCount
+                ),
+                cudaMemcpyDeviceToHost,
+                slot.stream
+            )
+        );
+
+        slot.batchIndex =
+            batchIndex;
+
+        slot.inFlight =
+            true;
+
+        CUDA_CHECK(
+            cudaEventRecord(
+                slot.completion,
+                slot.stream
+            )
+        );
+    }
+
+    for (auto& slot :
+         pipelineSlots_)
+    {
+        retireSlot(
+            *slot
+        );
+    }
+
+    const auto totalEnd =
+        std::chrono::steady_clock::now();
+
+    result.totalTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            totalEnd -
+            totalStart
+        ).count();
+
+    result.averageBatchTimeMs =
+        result.totalTimeMs /
+        static_cast<double>(
+            batchCount
+        );
+
+    const double totalQueries =
+        static_cast<double>(
+            batchCount
+        ) *
+        static_cast<double>(
+            queryCount
+        );
+
+    result.amortizedQueryTimeMs =
+        result.totalTimeMs /
+        totalQueries;
+
+    result.throughputQueriesPerSecond =
+        totalQueries *
+        1000.0 /
+        result.totalTimeMs;
+
+    return result;
+}
+
 // =========================================================
 // Warm-up methods
 // =========================================================
@@ -5721,6 +6565,71 @@ void GpuVectorIndex::warmUpTopKBatchTiledVectorizedFmaAuto(
             queryCount,
             topK
         );
+    }
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+}
+
+
+void GpuVectorIndex::warmUpTopKBatchTiledVectorizedFmaPipelined(
+    const int batchCount,
+    const int queryCount,
+    const int topK,
+    const int iterations)
+{
+    if (iterations <= 0)
+    {
+        throw std::invalid_argument(
+            "Warm-up iterations must be positive."
+        );
+    }
+
+    if (batchCount <= 0)
+    {
+        throw std::invalid_argument(
+            "batchCount must be positive."
+        );
+    }
+
+    if (queryCount <= 0 ||
+        queryCount >
+            MAX_BATCH_SIZE)
+    {
+        throw std::invalid_argument(
+            "queryCount must be between 1 and 32."
+        );
+    }
+
+    const std::size_t totalElements =
+        static_cast<std::size_t>(
+            batchCount
+        ) *
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            dimension_
+        );
+
+    std::vector<float> queries(
+        totalElements,
+        0.0F
+    );
+
+    for (int iteration = 0;
+         iteration <
+             iterations;
+         ++iteration)
+    {
+        (void)
+            searchTopKBatchTiledVectorizedFmaPipelined(
+                queries,
+                batchCount,
+                queryCount,
+                topK
+            );
     }
 
     CUDA_CHECK(

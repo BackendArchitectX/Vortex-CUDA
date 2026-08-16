@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -35,6 +36,15 @@ constexpr int GPU_WARMUP_RUNS =
 
 constexpr int BENCHMARK_RUNS =
     50;
+
+constexpr int PIPELINE_BATCH_COUNT =
+    16;
+
+constexpr int PIPELINE_BENCHMARK_RUNS =
+    10;
+
+constexpr int PIPELINE_WARMUP_RUNS =
+    2;
 
 constexpr float MAX_ALLOWED_ERROR =
     0.001F;
@@ -77,6 +87,27 @@ struct PathBenchmark
     int queryTileSize = 1;
     bool vectorizedLoadsUsed = false;
     bool fmaTunedKernelUsed = false;
+};
+
+
+struct PipelineComparison
+{
+    TimingStats sequentialStats;
+    TimingStats pipelinedStats;
+
+    std::vector<Neighbor> finalPipelinedNeighbors;
+
+    int queryCount = 0;
+    int batchCount = 0;
+    int queryTileSize = 1;
+    int streamCount = 0;
+
+    bool pinnedHostMemoryUsed = false;
+    bool vectorizedLoadsUsed = false;
+    bool fmaTunedKernelUsed = false;
+
+    bool indicesMatch = false;
+    float maxDistanceError = 0.0F;
 };
 
 struct BatchComparison
@@ -888,6 +919,331 @@ BatchComparison benchmarkBatchComparison(
     return comparison;
 }
 
+
+// =========================================================
+// Milestone 13 sequential-vs-pipelined benchmark
+// =========================================================
+
+std::vector<float> repeatQueryBatch(
+    const std::vector<float>& allQueries,
+    const int queryCount,
+    const int dimension,
+    const int batchCount)
+{
+    const std::size_t elementsPerBatch =
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    if (allQueries.size() <
+        elementsPerBatch)
+    {
+        throw std::invalid_argument(
+            "Not enough source queries to build pipeline input."
+        );
+    }
+
+    std::vector<float> repeated(
+        elementsPerBatch *
+        static_cast<std::size_t>(
+            batchCount
+        )
+    );
+
+    for (int batchIndex = 0;
+         batchIndex <
+             batchCount;
+         ++batchIndex)
+    {
+        std::copy_n(
+            allQueries.begin(),
+            static_cast<std::ptrdiff_t>(
+                elementsPerBatch
+            ),
+            repeated.begin() +
+                static_cast<std::ptrdiff_t>(
+                    static_cast<std::size_t>(
+                        batchIndex
+                    ) *
+                    elementsPerBatch
+                )
+        );
+    }
+
+    return repeated;
+}
+
+std::vector<Neighbor> repeatNeighborBatch(
+    const std::vector<Neighbor>& batchNeighbors,
+    const int batchCount)
+{
+    std::vector<Neighbor> repeated(
+        batchNeighbors.size() *
+        static_cast<std::size_t>(
+            batchCount
+        )
+    );
+
+    for (int batchIndex = 0;
+         batchIndex <
+             batchCount;
+         ++batchIndex)
+    {
+        std::copy(
+            batchNeighbors.begin(),
+            batchNeighbors.end(),
+            repeated.begin() +
+                static_cast<std::ptrdiff_t>(
+                    static_cast<std::size_t>(
+                        batchIndex
+                    ) *
+                    batchNeighbors.size()
+                )
+        );
+    }
+
+    return repeated;
+}
+
+double runSequentialM12PipelineBaseline(
+    GpuVectorIndex& index,
+    const std::vector<float>& repeatedQueries,
+    const int batchCount,
+    const int queryCount,
+    const int dimension,
+    const int topK)
+{
+    const std::size_t elementsPerBatch =
+        static_cast<std::size_t>(
+            queryCount
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    const std::vector<float> batch(
+        repeatedQueries.begin(),
+        repeatedQueries.begin() +
+            static_cast<
+                std::ptrdiff_t
+            >(
+                elementsPerBatch
+            )
+    );
+
+    const auto start =
+        std::chrono::steady_clock::now();
+
+    for (int batchIndex = 0;
+         batchIndex <
+             batchCount;
+         ++batchIndex)
+    {
+        (void)
+            index.searchTopKBatchTiledVectorizedFmaAuto(
+                batch,
+                queryCount,
+                topK
+            );
+    }
+
+    const auto stop =
+        std::chrono::steady_clock::now();
+
+    return
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            stop -
+            start
+        ).count();
+}
+
+PipelineComparison benchmarkPipelineComparison(
+    GpuVectorIndex& index,
+    const std::vector<float>& allQueries,
+    const std::vector<Neighbor>& expectedSingleBatch,
+    const int queryCount,
+    const int dimension,
+    const int topK)
+{
+    const std::vector<float> repeatedQueries =
+        repeatQueryBatch(
+            allQueries,
+            queryCount,
+            dimension,
+            PIPELINE_BATCH_COUNT
+        );
+
+    const std::vector<Neighbor> expected =
+        repeatNeighborBatch(
+            expectedSingleBatch,
+            PIPELINE_BATCH_COUNT
+        );
+
+    for (int run = 0;
+         run <
+             PIPELINE_WARMUP_RUNS;
+         ++run)
+    {
+        (void)
+            runSequentialM12PipelineBaseline(
+                index,
+                repeatedQueries,
+                PIPELINE_BATCH_COUNT,
+                queryCount,
+                dimension,
+                topK
+            );
+
+        (void)
+            index.searchTopKBatchTiledVectorizedFmaPipelined(
+                repeatedQueries,
+                PIPELINE_BATCH_COUNT,
+                queryCount,
+                topK
+            );
+    }
+
+    std::vector<double> sequentialTimes;
+    std::vector<double> pipelinedTimes;
+
+    sequentialTimes.reserve(
+        PIPELINE_BENCHMARK_RUNS
+    );
+
+    pipelinedTimes.reserve(
+        PIPELINE_BENCHMARK_RUNS
+    );
+
+    GpuPipelinedTopKResult finalPipeline;
+
+    for (int run = 0;
+         run <
+             PIPELINE_BENCHMARK_RUNS;
+         ++run)
+    {
+        double sequentialMs = 0.0;
+        GpuPipelinedTopKResult pipelined;
+
+        if ((run & 1) == 0)
+        {
+            sequentialMs =
+                runSequentialM12PipelineBaseline(
+                    index,
+                    repeatedQueries,
+                    PIPELINE_BATCH_COUNT,
+                    queryCount,
+                    dimension,
+                    topK
+                );
+
+            pipelined =
+                index.searchTopKBatchTiledVectorizedFmaPipelined(
+                    repeatedQueries,
+                    PIPELINE_BATCH_COUNT,
+                    queryCount,
+                    topK
+                );
+        }
+        else
+        {
+            pipelined =
+                index.searchTopKBatchTiledVectorizedFmaPipelined(
+                    repeatedQueries,
+                    PIPELINE_BATCH_COUNT,
+                    queryCount,
+                    topK
+                );
+
+            sequentialMs =
+                runSequentialM12PipelineBaseline(
+                    index,
+                    repeatedQueries,
+                    PIPELINE_BATCH_COUNT,
+                    queryCount,
+                    dimension,
+                    topK
+                );
+        }
+
+        sequentialTimes.push_back(
+            sequentialMs
+        );
+
+        pipelinedTimes.push_back(
+            pipelined.totalTimeMs
+        );
+
+        if (run ==
+            PIPELINE_BENCHMARK_RUNS - 1)
+        {
+            finalPipeline =
+                std::move(
+                    pipelined
+                );
+        }
+    }
+
+    PipelineComparison comparison;
+
+    comparison.sequentialStats =
+        calculateStats(
+            sequentialTimes
+        );
+
+    comparison.pipelinedStats =
+        calculateStats(
+            pipelinedTimes
+        );
+
+    comparison.finalPipelinedNeighbors =
+        std::move(
+            finalPipeline.neighbors
+        );
+
+    comparison.queryCount =
+        queryCount;
+
+    comparison.batchCount =
+        PIPELINE_BATCH_COUNT;
+
+    comparison.queryTileSize =
+        finalPipeline.queryTileSize;
+
+    comparison.streamCount =
+        finalPipeline.streamCount;
+
+    comparison.pinnedHostMemoryUsed =
+        finalPipeline.pinnedHostMemoryUsed;
+
+    comparison.vectorizedLoadsUsed =
+        finalPipeline.vectorizedLoadsUsed;
+
+    comparison.fmaTunedKernelUsed =
+        finalPipeline.fmaTunedKernelUsed;
+
+    comparison.indicesMatch =
+        neighborIndicesMatch(
+            expected,
+            comparison
+                .finalPipelinedNeighbors
+        );
+
+    comparison.maxDistanceError =
+        maxNeighborDistanceError(
+            expected,
+            comparison
+                .finalPipelinedNeighbors
+        );
+
+    return comparison;
+}
+
 // =========================================================
 // Printing
 // =========================================================
@@ -935,7 +1291,8 @@ enum class ProfilePath
     Milestone8,
     Milestone10,
     Milestone11,
-    Milestone12
+    Milestone12,
+    Milestone13
 };
 
 int runProfileMode(
@@ -955,6 +1312,8 @@ int runProfileMode(
             << "  vortex_cuda --profile-m11 "
             << "<vectorCount> <dimension> <topK> <batchSize>\n"
             << "  vortex_cuda --profile-m12 "
+            << "<vectorCount> <dimension> <topK> <batchSize>\n"
+            << "  vortex_cuda --profile-m13 "
             << "<vectorCount> <dimension> <topK> <batchSize>\n";
 
         return EXIT_FAILURE;
@@ -1038,13 +1397,20 @@ int runProfileMode(
         path ==
         ProfilePath::Milestone12;
 
+    const bool profileM13 =
+        path ==
+        ProfilePath::Milestone13;
+
     std::cout
         << "============================================\n"
         << (
-            profileM12
-                ? "       Vortex CUDA M12 Profile Mode\n"
+            profileM13
+                ? "       Vortex CUDA M13 Profile Mode\n"
                 : (
-                    profileM11
+                    profileM12
+                        ? "       Vortex CUDA M12 Profile Mode\n"
+                        : (
+                            profileM11
                         ? "       Vortex CUDA M11 Profile Mode\n"
                         : (
                             profileM10
@@ -1052,6 +1418,7 @@ int runProfileMode(
                                 : "       Vortex CUDA M8 Profile Mode\n"
                           )
                   )
+            )
         )
         << "============================================\n\n"
         << "GPU: "
@@ -1072,7 +1439,8 @@ int runProfileMode(
 
     if (profileM10 ||
         profileM11 ||
-        profileM12)
+        profileM12 ||
+        profileM13)
     {
         std::cout
             << "float4 eligible: "
@@ -1110,7 +1478,8 @@ int runProfileMode(
     );
 
     if (profileM11 ||
-        profileM12)
+        profileM12 ||
+        profileM13)
     {
         std::cout
             << "Autotuning query tile outside profiler range...\n";
@@ -1140,7 +1509,37 @@ int runProfileMode(
              PROFILE_WARMUP_RUNS;
          ++run)
     {
-        if (profileM12)
+        if (profileM13)
+        {
+            std::vector<float> pipelineQueries(
+                queries.size() *
+                4
+            );
+
+            for (int pipelineBatch = 0;
+                 pipelineBatch < 4;
+                 ++pipelineBatch)
+            {
+                std::copy(
+                    queries.begin(),
+                    queries.end(),
+                    pipelineQueries.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            pipelineBatch *
+                            queries.size()
+                        )
+                );
+            }
+
+            (void)gpuIndex
+                .searchTopKBatchTiledVectorizedFmaPipelined(
+                    pipelineQueries,
+                    4,
+                    batchSize,
+                    topK
+                );
+        }
+        else if (profileM12)
         {
             (void)gpuIndex
                 .searchTopKBatchTiledVectorizedFmaAuto(
@@ -1184,10 +1583,13 @@ int runProfileMode(
 
     std::cout
         << (
-            profileM12
-                ? "Starting focused M12 profile region...\n"
+            profileM13
+                ? "Starting focused M13 profile region...\n"
                 : (
-                    profileM11
+                    profileM12
+                        ? "Starting focused M12 profile region...\n"
+                        : (
+                            profileM11
                         ? "Starting focused M11 profile region...\n"
                         : (
                             profileM10
@@ -1195,6 +1597,7 @@ int runProfileMode(
                                 : "Starting focused M8 profile region...\n"
                           )
                   )
+            )
         );
 
     CUDA_CHECK(
@@ -1202,8 +1605,40 @@ int runProfileMode(
     );
 
     GpuBatchTopKResult result;
+    GpuPipelinedTopKResult pipelineResult;
 
-    if (profileM12)
+    if (profileM13)
+    {
+        std::vector<float> pipelineQueries(
+            queries.size() *
+            4
+        );
+
+        for (int pipelineBatch = 0;
+             pipelineBatch < 4;
+             ++pipelineBatch)
+        {
+            std::copy(
+                queries.begin(),
+                queries.end(),
+                pipelineQueries.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        pipelineBatch *
+                        queries.size()
+                    )
+            );
+        }
+
+        pipelineResult =
+            gpuIndex
+                .searchTopKBatchTiledVectorizedFmaPipelined(
+                    pipelineQueries,
+                    4,
+                    batchSize,
+                    topK
+                );
+    }
+    else if (profileM12)
     {
         result =
             gpuIndex
@@ -1255,36 +1690,87 @@ int runProfileMode(
     std::cout
         << std::fixed
         << std::setprecision(3)
-        << "\nFocused profile run completed.\n"
-        << "Query tile size:       "
-        << result.queryTileSize
-        << '\n'
-        << "Vectorized loads:      "
-        << (
-            result.vectorizedLoadsUsed
-                ? "yes"
-                : "no"
-        )
-        << '\n'
-        << "FMA-tuned kernel:      "
-        << (
-            result.fmaTunedKernelUsed
-                ? "yes"
-                : "no"
-        )
-        << '\n'
-        << "Tiled kernel time:     "
-        << result.fusedKernelTimeMs
-        << " ms\n"
-        << "Candidate merge time:  "
-        << result.mergeKernelTimeMs
-        << " ms\n"
-        << "End-to-end time:       "
-        << result.totalTimeMs
-        << " ms\n"
-        << "Returned neighbors:    "
-        << result.neighbors.size()
-        << '\n';
+        << "\nFocused profile run completed.\n";
+
+    if (profileM13)
+    {
+        std::cout
+            << "Pipeline batches:      "
+            << pipelineResult.batchCount
+            << '\n'
+            << "Queries per batch:     "
+            << pipelineResult.queryCount
+            << '\n'
+            << "Pipeline streams:      "
+            << pipelineResult.streamCount
+            << '\n'
+            << "Pinned host memory:    "
+            << (
+                pipelineResult.pinnedHostMemoryUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "Query tile size:       "
+            << pipelineResult.queryTileSize
+            << '\n'
+            << "Vectorized loads:      "
+            << (
+                pipelineResult.vectorizedLoadsUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "FMA-tuned kernel:      "
+            << (
+                pipelineResult.fmaTunedKernelUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "Pipeline total time:   "
+            << pipelineResult.totalTimeMs
+            << " ms\n"
+            << "Pipeline throughput:   "
+            << pipelineResult.throughputQueriesPerSecond
+            << " queries/sec\n"
+            << "Returned neighbors:    "
+            << pipelineResult.neighbors.size()
+            << '\n';
+    }
+    else
+    {
+        std::cout
+            << "Query tile size:       "
+            << result.queryTileSize
+            << '\n'
+            << "Vectorized loads:      "
+            << (
+                result.vectorizedLoadsUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "FMA-tuned kernel:      "
+            << (
+                result.fmaTunedKernelUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "Tiled kernel time:     "
+            << result.fusedKernelTimeMs
+            << " ms\n"
+            << "Candidate merge time:  "
+            << result.mergeKernelTimeMs
+            << " ms\n"
+            << "End-to-end time:       "
+            << result.totalTimeMs
+            << " ms\n"
+            << "Returned neighbors:    "
+            << result.neighbors.size()
+            << '\n';
+    }
 
     return EXIT_SUCCESS;
 }
@@ -1346,6 +1832,17 @@ int main(
                         argc,
                         argv,
                         ProfilePath::Milestone12
+                    );
+            }
+
+            if (mode ==
+                "--profile-m13")
+            {
+                return
+                    runProfileMode(
+                        argc,
+                        argv,
+                        ProfilePath::Milestone13
                     );
             }
         }
@@ -1427,7 +1924,7 @@ int main(
 
         std::cout
             << "============================================\n"
-            << " Vortex CUDA FMA-Tuned Vectorized Search\n"
+            << " Vortex CUDA Dual-Stream Pipelined Search\n"
             << "============================================\n\n"
             << "GPU: "
             << device.name
@@ -1439,6 +1936,19 @@ int main(
             << '\n'
             << "Multiprocessors: "
             << device.multiProcessorCount
+            << '\n'
+            << "Async copy engines: "
+            << device.asyncEngineCount
+            << '\n'
+            << "Concurrent kernels: "
+            << (
+                device.concurrentKernels
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "Pipeline streams: "
+            << GpuVectorIndex::PIPELINE_STREAM_COUNT
             << '\n'
             << "Dataset: "
             << vectorCount
@@ -2044,6 +2554,166 @@ int main(
             return EXIT_FAILURE;
         }
 
+        std::cout
+            << "\nBenchmarking M13 dual-stream pipeline using "
+            << best.batchSize
+            << " queries/batch and "
+            << PIPELINE_BATCH_COUNT
+            << " consecutive batches...\n";
+
+        const PipelineComparison pipeline =
+            benchmarkPipelineComparison(
+                gpuIndex,
+                allQueries,
+                best
+                    .milestone12
+                    .finalNeighbors,
+                best.batchSize,
+                dimension,
+                topK
+            );
+
+        const bool pipelineNumeric =
+            std::isfinite(
+                pipeline.maxDistanceError
+            ) &&
+            pipeline.maxDistanceError <=
+                MAX_ALLOWED_ERROR;
+
+        const double totalQueriesPerRun =
+            static_cast<double>(
+                pipeline.batchCount
+            ) *
+            static_cast<double>(
+                pipeline.queryCount
+            );
+
+        const double sequentialQps =
+            totalQueriesPerRun *
+            1000.0 /
+            pipeline
+                .sequentialStats
+                .p50;
+
+        const double pipelinedQps =
+            totalQueriesPerRun *
+            1000.0 /
+            pipeline
+                .pipelinedStats
+                .p50;
+
+        const double pipelineGain =
+            pipeline
+                .sequentialStats
+                .p50 /
+            pipeline
+                .pipelinedStats
+                .p50;
+
+        std::cout
+            << "\n============================================\n"
+            << "       M13 Dual-Stream Pipeline Results\n"
+            << "============================================\n"
+            << "Queries per batch:           "
+            << pipeline.queryCount
+            << '\n'
+            << "Pipeline batches/run:        "
+            << pipeline.batchCount
+            << '\n'
+            << "Total queries/run:           "
+            << static_cast<long long>(
+                totalQueriesPerRun
+            )
+            << '\n'
+            << "Pipeline streams:            "
+            << pipeline.streamCount
+            << '\n'
+            << "Pinned host memory:          "
+            << (
+                pipeline
+                    .pinnedHostMemoryUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "Selected query tile:         "
+            << pipeline.queryTileSize
+            << '\n'
+            << "Vectorized loads:            "
+            << (
+                pipeline
+                    .vectorizedLoadsUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "FMA-tuned kernel:            "
+            << (
+                pipeline
+                    .fmaTunedKernelUsed
+                    ? "yes"
+                    : "no"
+            )
+            << '\n'
+            << "Sequential M12 P50:          "
+            << pipeline
+                .sequentialStats
+                .p50
+            << " ms\n"
+            << "Pipelined M13 P50:           "
+            << pipeline
+                .pipelinedStats
+                .p50
+            << " ms\n"
+            << "Pipelined M13 P95:           "
+            << pipeline
+                .pipelinedStats
+                .p95
+            << " ms\n"
+            << "Pipelined M13 P99:           "
+            << pipeline
+                .pipelinedStats
+                .p99
+            << " ms\n"
+            << "Sequential M12 throughput:   "
+            << sequentialQps
+            << " queries/sec\n"
+            << "Pipelined M13 throughput:    "
+            << pipelinedQps
+            << " queries/sec\n"
+            << "Pipeline throughput gain:    "
+            << pipelineGain
+            << "x\n"
+            << "M13 exact indices:           "
+            << (
+                pipeline.indicesMatch
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << '\n'
+            << "M13 numeric tolerance:       "
+            << (
+                pipelineNumeric
+                    ? "PASS"
+                    : "FAIL"
+            )
+            << '\n'
+            << "M13 max distance error:      "
+            << std::setprecision(8)
+            << pipeline.maxDistanceError
+            << '\n'
+            << std::setprecision(3);
+
+        if (!pipeline.indicesMatch ||
+            !pipelineNumeric)
+        {
+            std::cerr
+                << "\nMilestone 13 pipeline correctness "
+                << "validation failed.\n";
+
+            return EXIT_FAILURE;
+        }
+
         printFirstQueryNeighbors(
             best
                 .milestone12
@@ -2052,36 +2722,39 @@ int main(
         );
 
         std::cout
-            << "\nMilestone 12 completed successfully.\n";
+            << "\nMilestone 13 completed successfully.\n";
 
         if (!best
                 .milestone12
                 .vectorizedLoadsUsed)
         {
             std::cout
-                << "Dimension is not divisible by four; "
-                << "M12 correctly preserved the scalar fallback.\n";
+                << "The dimension is not divisible by four; "
+                << "M13 preserved the scalar query-tiled fallback "
+                << "inside the asynchronous pipeline.\n";
         }
-        else if (bestGain >=
+
+        if (pipelineGain >=
             1.02)
         {
             std::cout
-                << "Instruction/FMA tuning produced a measurable "
-                << "throughput improvement.\n";
+                << "Pinned staging and dual non-blocking CUDA streams "
+                << "produced a measurable end-to-end throughput gain.\n";
         }
-        else if (bestGain >=
+        else if (pipelineGain >=
             0.98)
         {
             std::cout
-                << "M12 is performance-equivalent to M11 within "
-                << "the benchmark noise band; use Nsight counters "
-                << "to decide whether to keep the tuned kernel.\n";
+                << "The dual-stream pipeline is performance-equivalent "
+                << "to sequential M12 within the benchmark noise band; "
+                << "the pipeline architecture remains validated.\n";
         }
         else
         {
             std::cout
-                << "M12 is slower than M11 on this workload; "
-                << "retain M11 as the performance default.\n";
+                << "The dual-stream pipeline is slower on this workload; "
+                << "retain sequential M12 as the latency default while "
+                << "keeping M13 for sustained multi-batch workloads.\n";
         }
 
         return EXIT_SUCCESS;

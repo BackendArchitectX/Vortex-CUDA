@@ -7,6 +7,12 @@
 #include <cstddef>
 #include <vector>
 
+enum class DistanceKernel
+{
+    SharedMemory,
+    WarpShuffle
+};
+
 struct GpuSearchResult
 {
     std::vector<float> distances;
@@ -47,10 +53,14 @@ public:
 
     [[nodiscard]]
     GpuSearchResult search(
-        const std::vector<float>& query
+        const std::vector<float>& query,
+        DistanceKernel kernel
     );
 
-    void warmUp();
+    void warmUp(
+        DistanceKernel kernel,
+        int iterations = 1
+    );
 
     [[nodiscard]]
     int vectorCount() const noexcept

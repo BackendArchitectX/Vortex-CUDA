@@ -14,6 +14,9 @@ namespace
 {
 
 constexpr int CUDA_BLOCK_SIZE = 256;
+constexpr int CUDA_WARP_SIZE = 32;
+constexpr int WARPS_PER_BLOCK =
+    CUDA_BLOCK_SIZE / CUDA_WARP_SIZE;
 
 // ---------------------------------------------------------
 // Validation helpers
@@ -79,11 +82,37 @@ std::size_t validateDatabase(
 
 } // namespace
 
-// ---------------------------------------------------------
-// CUDA L2 distance kernel
-// ---------------------------------------------------------
+// =========================================================
+// Device reduction helper
+// =========================================================
 
-__global__ void l2DistanceKernel(
+__inline__ __device__
+float warpReduceSum(float value)
+{
+    constexpr unsigned int FULL_MASK =
+        0xFFFFFFFFU;
+
+    for (int offset =
+             CUDA_WARP_SIZE / 2;
+         offset > 0;
+         offset >>= 1)
+    {
+        value +=
+            __shfl_down_sync(
+                FULL_MASK,
+                value,
+                offset
+            );
+    }
+
+    return value;
+}
+
+// =========================================================
+// V1 — Shared-memory reduction
+// =========================================================
+
+__global__ void l2DistanceSharedKernel(
     const float* __restrict__ database,
     const float* __restrict__ query,
     float* __restrict__ distances,
@@ -129,17 +158,14 @@ __global__ void l2DistanceKernel(
             query[d];
 
         localSum +=
-            difference * difference;
+            difference *
+            difference;
     }
 
     partial[threadId] =
         localSum;
 
     __syncthreads();
-
-    // -----------------------------------------------------
-    // Shared-memory parallel reduction
-    // -----------------------------------------------------
 
     for (unsigned int stride =
              blockDim.x / 2;
@@ -165,9 +191,114 @@ __global__ void l2DistanceKernel(
     }
 }
 
-// ---------------------------------------------------------
+// =========================================================
+// V2 — Warp-shuffle reduction
+// =========================================================
+
+__global__ void l2DistanceWarpKernel(
+    const float* __restrict__ database,
+    const float* __restrict__ query,
+    float* __restrict__ distances,
+    const int vectorCount,
+    const int dimension)
+{
+    const int vectorIndex =
+        static_cast<int>(
+            blockIdx.x
+        );
+
+    if (vectorIndex >= vectorCount)
+    {
+        return;
+    }
+
+    const int threadId =
+        static_cast<int>(
+            threadIdx.x
+        );
+
+    const int laneId =
+        threadId &
+        (CUDA_WARP_SIZE - 1);
+
+    const int warpId =
+        threadId /
+        CUDA_WARP_SIZE;
+
+    __shared__ float warpSums[
+        WARPS_PER_BLOCK
+    ];
+
+    const float* vector =
+        database +
+        static_cast<std::size_t>(
+            vectorIndex
+        ) *
+        static_cast<std::size_t>(
+            dimension
+        );
+
+    float localSum = 0.0F;
+
+    for (int d = threadId;
+         d < dimension;
+         d += static_cast<int>(
+             blockDim.x
+         ))
+    {
+        const float difference =
+            vector[d] -
+            query[d];
+
+        localSum +=
+            difference *
+            difference;
+    }
+
+    // First-stage reduction happens completely
+    // inside each warp.
+    localSum =
+        warpReduceSum(
+            localSum
+        );
+
+    // Lane zero writes one value per warp.
+    if (laneId == 0)
+    {
+        warpSums[warpId] =
+            localSum;
+    }
+
+    __syncthreads();
+
+    // Only the first warp performs the
+    // final block-level reduction.
+    if (warpId == 0)
+    {
+        float blockSum = 0.0F;
+
+        if (laneId < WARPS_PER_BLOCK)
+        {
+            blockSum =
+                warpSums[laneId];
+        }
+
+        blockSum =
+            warpReduceSum(
+                blockSum
+            );
+
+        if (laneId == 0)
+        {
+            distances[vectorIndex] =
+                blockSum;
+        }
+    }
+}
+
+// =========================================================
 // Constructor
-// ---------------------------------------------------------
+// =========================================================
 
 GpuVectorIndex::GpuVectorIndex(
     const std::vector<float>& database,
@@ -199,10 +330,6 @@ GpuVectorIndex::GpuVectorIndex(
         )
     )
 {
-    // -----------------------------------------------------
-    // Persistent CUDA timing events
-    // -----------------------------------------------------
-
     CUDA_CHECK(
         cudaEventCreate(
             &kernelStart_
@@ -253,9 +380,9 @@ GpuVectorIndex::GpuVectorIndex(
         ).count();
 }
 
-// ---------------------------------------------------------
+// =========================================================
 // Destructor
-// ---------------------------------------------------------
+// =========================================================
 
 GpuVectorIndex::~GpuVectorIndex()
 {
@@ -274,12 +401,13 @@ GpuVectorIndex::~GpuVectorIndex()
     }
 }
 
-// ---------------------------------------------------------
+// =========================================================
 // Search
-// ---------------------------------------------------------
+// =========================================================
 
 GpuSearchResult GpuVectorIndex::search(
-    const std::vector<float>& query)
+    const std::vector<float>& query,
+    const DistanceKernel kernel)
 {
     if (query.size() !=
         static_cast<std::size_t>(
@@ -292,8 +420,6 @@ GpuSearchResult GpuVectorIndex::search(
         );
     }
 
-    // End-to-end query timing starts BEFORE
-    // allocating the host result vector.
     const auto totalStart =
         std::chrono::steady_clock::now();
 
@@ -306,7 +432,7 @@ GpuSearchResult GpuVectorIndex::search(
     );
 
     // -----------------------------------------------------
-    // Upload query
+    // Query upload
     // -----------------------------------------------------
 
     const auto uploadStart =
@@ -337,7 +463,7 @@ GpuSearchResult GpuVectorIndex::search(
         ).count();
 
     // -----------------------------------------------------
-    // Execute CUDA kernel
+    // Kernel
     // -----------------------------------------------------
 
     CUDA_CHECK(
@@ -346,23 +472,54 @@ GpuSearchResult GpuVectorIndex::search(
         )
     );
 
-    const std::size_t sharedMemoryBytes =
-        static_cast<std::size_t>(
-            CUDA_BLOCK_SIZE
-        ) *
-        sizeof(float);
+    switch (kernel)
+    {
+        case DistanceKernel::SharedMemory:
+        {
+            const std::size_t sharedMemoryBytes =
+                static_cast<std::size_t>(
+                    CUDA_BLOCK_SIZE
+                ) *
+                sizeof(float);
 
-    l2DistanceKernel<<<
-        vectorCount_,
-        CUDA_BLOCK_SIZE,
-        sharedMemoryBytes
-    >>>(
-        deviceDatabase_.data(),
-        deviceQuery_.data(),
-        deviceDistances_.data(),
-        vectorCount_,
-        dimension_
-    );
+            l2DistanceSharedKernel<<<
+                vectorCount_,
+                CUDA_BLOCK_SIZE,
+                sharedMemoryBytes
+            >>>(
+                deviceDatabase_.data(),
+                deviceQuery_.data(),
+                deviceDistances_.data(),
+                vectorCount_,
+                dimension_
+            );
+
+            break;
+        }
+
+        case DistanceKernel::WarpShuffle:
+        {
+            l2DistanceWarpKernel<<<
+                vectorCount_,
+                CUDA_BLOCK_SIZE
+            >>>(
+                deviceDatabase_.data(),
+                deviceQuery_.data(),
+                deviceDistances_.data(),
+                vectorCount_,
+                dimension_
+            );
+
+            break;
+        }
+
+        default:
+        {
+            throw std::invalid_argument(
+                "Unknown distance kernel."
+            );
+        }
+    }
 
     CUDA_CHECK(
         cudaGetLastError()
@@ -389,7 +546,7 @@ GpuSearchResult GpuVectorIndex::search(
     );
 
     // -----------------------------------------------------
-    // Download all distances
+    // Result download
     // -----------------------------------------------------
 
     const auto downloadStart =
@@ -419,10 +576,6 @@ GpuSearchResult GpuVectorIndex::search(
             downloadStart
         ).count();
 
-    // -----------------------------------------------------
-    // End-to-end query latency
-    // -----------------------------------------------------
-
     const auto totalEnd =
         std::chrono::steady_clock::now();
 
@@ -438,12 +591,21 @@ GpuSearchResult GpuVectorIndex::search(
     return result;
 }
 
-// ---------------------------------------------------------
+// =========================================================
 // Warm-up
-// ---------------------------------------------------------
+// =========================================================
 
-void GpuVectorIndex::warmUp()
+void GpuVectorIndex::warmUp(
+    const DistanceKernel kernel,
+    const int iterations)
 {
+    if (iterations <= 0)
+    {
+        throw std::invalid_argument(
+            "Warm-up iterations must be positive."
+        );
+    }
+
     std::vector<float> warmupQuery(
         static_cast<std::size_t>(
             dimension_
@@ -451,9 +613,15 @@ void GpuVectorIndex::warmUp()
         0.0F
     );
 
-    (void)search(
-        warmupQuery
-    );
+    for (int i = 0;
+         i < iterations;
+         ++i)
+    {
+        (void)search(
+            warmupQuery,
+            kernel
+        );
+    }
 
     CUDA_CHECK(
         cudaDeviceSynchronize()

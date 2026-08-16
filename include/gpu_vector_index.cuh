@@ -21,6 +21,12 @@ struct GpuSearchConfig
     int blockSize = 256;
 };
 
+struct Neighbor
+{
+    int index = -1;
+    float distance = 0.0F;
+};
+
 struct GpuSearchResult
 {
     std::vector<float> distances;
@@ -32,9 +38,25 @@ struct GpuSearchResult
     double totalTimeMs = 0.0;
 };
 
+struct GpuTopKResult
+{
+    std::vector<Neighbor> neighbors;
+
+    float distanceKernelTimeMs = 0.0F;
+    float topKKernelTimeMs = 0.0F;
+
+    double queryUploadTimeMs = 0.0;
+    double resultDownloadTimeMs = 0.0;
+    double totalTimeMs = 0.0;
+
+    int topKPasses = 0;
+};
+
 class GpuVectorIndex
 {
 public:
+    static constexpr int MAX_TOP_K = 32;
+
     GpuVectorIndex(
         const std::vector<float>& database,
         int vectorCount,
@@ -65,8 +87,21 @@ public:
         const GpuSearchConfig& config
     );
 
+    [[nodiscard]]
+    GpuTopKResult searchTopK(
+        const std::vector<float>& query,
+        int topK,
+        const GpuSearchConfig& config
+    );
+
     void warmUp(
         const GpuSearchConfig& config,
+        int iterations = 1
+    );
+
+    void warmUpTopK(
+        const GpuSearchConfig& config,
+        int topK,
         int iterations = 1
     );
 
@@ -114,8 +149,14 @@ private:
     DeviceBuffer<float> deviceQuery_;
     DeviceBuffer<float> deviceDistances_;
 
-    cudaEvent_t kernelStart_{};
-    cudaEvent_t kernelStop_{};
+    DeviceBuffer<Neighbor> deviceTopKBufferA_;
+    DeviceBuffer<Neighbor> deviceTopKBufferB_;
+
+    cudaEvent_t distanceStart_{};
+    cudaEvent_t distanceStop_{};
+
+    cudaEvent_t topKStart_{};
+    cudaEvent_t topKStop_{};
 
     double indexUploadTimeMs_ = 0.0;
 };

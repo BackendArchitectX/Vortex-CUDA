@@ -4,19 +4,22 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
 {
 
 constexpr int CUDA_WARP_SIZE = 32;
+constexpr int TOPK_BLOCK_SIZE = 256;
 
 // =========================================================
-// Validation
+// Utility
 // =========================================================
 
 std::size_t requirePositive(
@@ -34,6 +37,15 @@ std::size_t requirePositive(
     return static_cast<std::size_t>(
         value
     );
+}
+
+std::size_t ceilDivide(
+    const std::size_t value,
+    const std::size_t divisor)
+{
+    return
+        (value + divisor - 1) /
+        divisor;
 }
 
 std::size_t validateDatabase(
@@ -79,6 +91,43 @@ std::size_t validateDatabase(
     return expectedElements;
 }
 
+std::size_t calculateTopKBufferCapacity(
+    const int vectorCount)
+{
+    const std::size_t vectors =
+        requirePositive(
+            vectorCount,
+            "vectorCount"
+        );
+
+    const std::size_t blockCount =
+        ceilDivide(
+            vectors,
+            static_cast<std::size_t>(
+                TOPK_BLOCK_SIZE
+            )
+        );
+
+    if (blockCount >
+        std::numeric_limits<
+            std::size_t
+        >::max() /
+        static_cast<std::size_t>(
+            GpuVectorIndex::MAX_TOP_K
+        ))
+    {
+        throw std::overflow_error(
+            "Top-K intermediate buffer size overflow."
+        );
+    }
+
+    return
+        blockCount *
+        static_cast<std::size_t>(
+            GpuVectorIndex::MAX_TOP_K
+        );
+}
+
 } // namespace
 
 // =========================================================
@@ -109,11 +158,7 @@ float warpReduceSum(
 }
 
 // =========================================================
-// V1 — Shared-memory reduction
-//
-// Templated so the implementation remains valid for
-// different block sizes, although Milestone 4 keeps the
-// 256-thread version as the historical baseline.
+// Shared-memory distance kernel
 // =========================================================
 
 template <int BLOCK_SIZE>
@@ -153,20 +198,29 @@ __global__ void l2DistanceSharedKernel(
 
     float localSum = 0.0F;
 
-    for (int d = threadId;
-         d < dimension;
-         d += BLOCK_SIZE)
+    for (int dimensionIndex =
+             threadId;
+         dimensionIndex <
+             dimension;
+         dimensionIndex +=
+             BLOCK_SIZE)
     {
         const float difference =
-            vector[d] -
-            query[d];
+            vector[
+                dimensionIndex
+            ] -
+            query[
+                dimensionIndex
+            ];
 
         localSum +=
             difference *
             difference;
     }
 
-    partial[threadId] =
+    partial[
+        threadId
+    ] =
         localSum;
 
     __syncthreads();
@@ -176,7 +230,8 @@ __global__ void l2DistanceSharedKernel(
          stride > 0;
          stride >>= 1)
     {
-        if (threadIdx.x < stride)
+        if (threadIdx.x <
+            stride)
         {
             partial[
                 threadIdx.x
@@ -200,15 +255,7 @@ __global__ void l2DistanceSharedKernel(
 }
 
 // =========================================================
-// V2 — Warp-shuffle reduction
-//
-// BLOCK_SIZE is compile-time specialized.
-//
-// Supported:
-//   32
-//   64
-//   128
-//   256
+// Warp-shuffle distance kernel
 // =========================================================
 
 template <int BLOCK_SIZE>
@@ -262,27 +309,25 @@ __global__ void l2DistanceWarpKernel(
 
     float localSum = 0.0F;
 
-    // -----------------------------------------------------
-    // Each thread processes zero or more dimensions.
-    // -----------------------------------------------------
-
-    for (int d = threadId;
-         d < dimension;
-         d += BLOCK_SIZE)
+    for (int dimensionIndex =
+             threadId;
+         dimensionIndex <
+             dimension;
+         dimensionIndex +=
+             BLOCK_SIZE)
     {
         const float difference =
-            vector[d] -
-            query[d];
+            vector[
+                dimensionIndex
+            ] -
+            query[
+                dimensionIndex
+            ];
 
         localSum +=
             difference *
             difference;
     }
-
-    // -----------------------------------------------------
-    // Stage 1:
-    // Reduce inside each warp.
-    // -----------------------------------------------------
 
     localSum =
         warpReduceSum(
@@ -298,11 +343,6 @@ __global__ void l2DistanceWarpKernel(
     }
 
     __syncthreads();
-
-    // -----------------------------------------------------
-    // Stage 2:
-    // First warp reduces all per-warp sums.
-    // -----------------------------------------------------
 
     if (warpId == 0)
     {
@@ -330,7 +370,298 @@ __global__ void l2DistanceWarpKernel(
 }
 
 // =========================================================
-// Launch helpers
+// GPU Top-K helpers
+// =========================================================
+
+__inline__ __device__
+Neighbor makeInvalidNeighbor()
+{
+    Neighbor neighbor;
+
+    // +infinity
+    neighbor.distance =
+        __int_as_float(
+            0x7F800000
+        );
+
+    neighbor.index =
+        INT_MAX;
+
+    return neighbor;
+}
+
+__inline__ __device__
+bool neighborLess(
+    const Neighbor& left,
+    const Neighbor& right)
+{
+    if (left.distance <
+        right.distance)
+    {
+        return true;
+    }
+
+    if (left.distance >
+        right.distance)
+    {
+        return false;
+    }
+
+    return
+        left.index <
+        right.index;
+}
+
+template <int BLOCK_SIZE>
+__device__ void bitonicSortNeighbors(
+    Neighbor* values)
+{
+    const unsigned int threadId =
+        static_cast<unsigned int>(
+            threadIdx.x
+        );
+
+    for (unsigned int sequenceSize = 2;
+         sequenceSize <= BLOCK_SIZE;
+         sequenceSize <<= 1)
+    {
+        for (unsigned int stride =
+                 sequenceSize >> 1;
+             stride > 0;
+             stride >>= 1)
+        {
+            const unsigned int partner =
+                threadId ^
+                stride;
+
+            if (partner >
+                threadId)
+            {
+                const bool ascending =
+                    (
+                        threadId &
+                        sequenceSize
+                    ) == 0;
+
+                const Neighbor left =
+                    values[
+                        threadId
+                    ];
+
+                const Neighbor right =
+                    values[
+                        partner
+                    ];
+
+                const bool shouldSwap =
+                    ascending
+                        ? neighborLess(
+                            right,
+                            left
+                        )
+                        : neighborLess(
+                            left,
+                            right
+                        );
+
+                if (shouldSwap)
+                {
+                    values[
+                        threadId
+                    ] =
+                        right;
+
+                    values[
+                        partner
+                    ] =
+                        left;
+                }
+            }
+
+            __syncthreads();
+        }
+    }
+}
+
+// =========================================================
+// Top-K stage 1
+//
+// Input:
+//   full distance array
+//
+// Output:
+//   K best candidates per 256-distance block
+// =========================================================
+
+__global__ void topKFromDistancesKernel(
+    const float* __restrict__ distances,
+    Neighbor* __restrict__ output,
+    const int count,
+    const int topK)
+{
+    __shared__ Neighbor candidates[
+        TOPK_BLOCK_SIZE
+    ];
+
+    const int threadId =
+        static_cast<int>(
+            threadIdx.x
+        );
+
+    const std::size_t globalIndex =
+        static_cast<std::size_t>(
+            blockIdx.x
+        ) *
+        static_cast<std::size_t>(
+            TOPK_BLOCK_SIZE
+        ) +
+        static_cast<std::size_t>(
+            threadId
+        );
+
+    Neighbor candidate =
+        makeInvalidNeighbor();
+
+    if (globalIndex <
+        static_cast<std::size_t>(
+            count
+        ))
+    {
+        candidate.index =
+            static_cast<int>(
+                globalIndex
+            );
+
+        candidate.distance =
+            distances[
+                globalIndex
+            ];
+    }
+
+    candidates[
+        threadId
+    ] =
+        candidate;
+
+    __syncthreads();
+
+    bitonicSortNeighbors<
+        TOPK_BLOCK_SIZE
+    >(
+        candidates
+    );
+
+    if (threadId <
+        topK)
+    {
+        const std::size_t outputIndex =
+            static_cast<std::size_t>(
+                blockIdx.x
+            ) *
+            static_cast<std::size_t>(
+                topK
+            ) +
+            static_cast<std::size_t>(
+                threadId
+            );
+
+        output[
+            outputIndex
+        ] =
+            candidates[
+                threadId
+            ];
+    }
+}
+
+// =========================================================
+// Top-K merge stage
+//
+// Input:
+//   candidates from previous hierarchy level
+//
+// Output:
+//   K best candidates per 256-candidate block
+// =========================================================
+
+__global__ void topKFromCandidatesKernel(
+    const Neighbor* __restrict__ input,
+    Neighbor* __restrict__ output,
+    const int count,
+    const int topK)
+{
+    __shared__ Neighbor candidates[
+        TOPK_BLOCK_SIZE
+    ];
+
+    const int threadId =
+        static_cast<int>(
+            threadIdx.x
+        );
+
+    const std::size_t globalIndex =
+        static_cast<std::size_t>(
+            blockIdx.x
+        ) *
+        static_cast<std::size_t>(
+            TOPK_BLOCK_SIZE
+        ) +
+        static_cast<std::size_t>(
+            threadId
+        );
+
+    Neighbor candidate =
+        makeInvalidNeighbor();
+
+    if (globalIndex <
+        static_cast<std::size_t>(
+            count
+        ))
+    {
+        candidate =
+            input[
+                globalIndex
+            ];
+    }
+
+    candidates[
+        threadId
+    ] =
+        candidate;
+
+    __syncthreads();
+
+    bitonicSortNeighbors<
+        TOPK_BLOCK_SIZE
+    >(
+        candidates
+    );
+
+    if (threadId <
+        topK)
+    {
+        const std::size_t outputIndex =
+            static_cast<std::size_t>(
+                blockIdx.x
+            ) *
+            static_cast<std::size_t>(
+                topK
+            ) +
+            static_cast<std::size_t>(
+                threadId
+            );
+
+        output[
+            outputIndex
+        ] =
+            candidates[
+                threadId
+            ];
+    }
+}
+
+// =========================================================
+// Distance-kernel launch helpers
 // =========================================================
 
 namespace
@@ -547,23 +878,41 @@ GpuVectorIndex::GpuVectorIndex(
             vectorCount,
             "vectorCount"
         )
+    ),
+      deviceTopKBufferA_(
+        calculateTopKBufferCapacity(
+            vectorCount
+        )
+    ),
+      deviceTopKBufferB_(
+        calculateTopKBufferCapacity(
+            vectorCount
+        )
     )
 {
     CUDA_CHECK(
         cudaEventCreate(
-            &kernelStart_
+            &distanceStart_
         )
     );
 
     CUDA_CHECK(
         cudaEventCreate(
-            &kernelStop_
+            &distanceStop_
         )
     );
 
-    // -----------------------------------------------------
-    // Upload the vector database only once.
-    // -----------------------------------------------------
+    CUDA_CHECK(
+        cudaEventCreate(
+            &topKStart_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventCreate(
+            &topKStop_
+        )
+    );
 
     const std::size_t elementCount =
         static_cast<std::size_t>(
@@ -605,17 +954,31 @@ GpuVectorIndex::GpuVectorIndex(
 
 GpuVectorIndex::~GpuVectorIndex()
 {
-    if (kernelStart_ != nullptr)
+    if (distanceStart_ != nullptr)
     {
         cudaEventDestroy(
-            kernelStart_
+            distanceStart_
         );
     }
 
-    if (kernelStop_ != nullptr)
+    if (distanceStop_ != nullptr)
     {
         cudaEventDestroy(
-            kernelStop_
+            distanceStop_
+        );
+    }
+
+    if (topKStart_ != nullptr)
+    {
+        cudaEventDestroy(
+            topKStart_
+        );
+    }
+
+    if (topKStop_ != nullptr)
+    {
+        cudaEventDestroy(
+            topKStop_
         );
     }
 }
@@ -635,7 +998,7 @@ bool GpuVectorIndex::isSupportedBlockSize(
 }
 
 // =========================================================
-// Search
+// Full-distance reference search
 // =========================================================
 
 GpuSearchResult GpuVectorIndex::search(
@@ -658,9 +1021,7 @@ GpuSearchResult GpuVectorIndex::search(
         ))
     {
         throw std::invalid_argument(
-            "Unsupported CUDA block size. "
-            "Supported sizes are "
-            "32, 64, 128 and 256."
+            "Unsupported CUDA block size."
         );
     }
 
@@ -674,10 +1035,6 @@ GpuSearchResult GpuVectorIndex::search(
             vectorCount_
         )
     );
-
-    // -----------------------------------------------------
-    // Query upload
-    // -----------------------------------------------------
 
     const auto uploadStart =
         std::chrono::steady_clock::now();
@@ -706,13 +1063,9 @@ GpuSearchResult GpuVectorIndex::search(
             uploadStart
         ).count();
 
-    // -----------------------------------------------------
-    // Kernel
-    // -----------------------------------------------------
-
     CUDA_CHECK(
         cudaEventRecord(
-            kernelStart_
+            distanceStart_
         )
     );
 
@@ -731,27 +1084,23 @@ GpuSearchResult GpuVectorIndex::search(
 
     CUDA_CHECK(
         cudaEventRecord(
-            kernelStop_
+            distanceStop_
         )
     );
 
     CUDA_CHECK(
         cudaEventSynchronize(
-            kernelStop_
+            distanceStop_
         )
     );
 
     CUDA_CHECK(
         cudaEventElapsedTime(
             &result.kernelTimeMs,
-            kernelStart_,
-            kernelStop_
+            distanceStart_,
+            distanceStop_
         )
     );
-
-    // -----------------------------------------------------
-    // Download all distances
-    // -----------------------------------------------------
 
     const auto downloadStart =
         std::chrono::steady_clock::now();
@@ -796,7 +1145,287 @@ GpuSearchResult GpuVectorIndex::search(
 }
 
 // =========================================================
-// Warm-up
+// Hierarchical GPU Top-K search
+// =========================================================
+
+GpuTopKResult GpuVectorIndex::searchTopK(
+    const std::vector<float>& query,
+    const int topK,
+    const GpuSearchConfig& config)
+{
+    if (query.size() !=
+        static_cast<std::size_t>(
+            dimension_
+        ))
+    {
+        throw std::invalid_argument(
+            "Query dimension does not match "
+            "index dimension."
+        );
+    }
+
+    if (!isSupportedBlockSize(
+            config.blockSize
+        ))
+    {
+        throw std::invalid_argument(
+            "Unsupported CUDA block size."
+        );
+    }
+
+    if (topK <= 0 ||
+        topK > MAX_TOP_K ||
+        topK > vectorCount_)
+    {
+        throw std::invalid_argument(
+            "topK must be between 1 and "
+            "min(vectorCount, 32)."
+        );
+    }
+
+    const auto totalStart =
+        std::chrono::steady_clock::now();
+
+    GpuTopKResult result;
+
+    result.neighbors.resize(
+        static_cast<std::size_t>(
+            topK
+        )
+    );
+
+    // -----------------------------------------------------
+    // Upload query
+    // -----------------------------------------------------
+
+    const auto uploadStart =
+        std::chrono::steady_clock::now();
+
+    CUDA_CHECK(
+        cudaMemcpy(
+            deviceQuery_.data(),
+            query.data(),
+            static_cast<std::size_t>(
+                dimension_
+            ) *
+                sizeof(float),
+            cudaMemcpyHostToDevice
+        )
+    );
+
+    const auto uploadEnd =
+        std::chrono::steady_clock::now();
+
+    result.queryUploadTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            uploadEnd -
+            uploadStart
+        ).count();
+
+    // -----------------------------------------------------
+    // Distance kernel
+    // -----------------------------------------------------
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            distanceStart_
+        )
+    );
+
+    launchConfiguredKernel(
+        config,
+        deviceDatabase_.data(),
+        deviceQuery_.data(),
+        deviceDistances_.data(),
+        vectorCount_,
+        dimension_
+    );
+
+    CUDA_CHECK(
+        cudaGetLastError()
+    );
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            distanceStop_
+        )
+    );
+
+    // -----------------------------------------------------
+    // Hierarchical Top-K
+    // -----------------------------------------------------
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            topKStart_
+        )
+    );
+
+    const std::size_t firstBlockCount =
+        ceilDivide(
+            static_cast<std::size_t>(
+                vectorCount_
+            ),
+            static_cast<std::size_t>(
+                TOPK_BLOCK_SIZE
+            )
+        );
+
+    topKFromDistancesKernel<<<
+        static_cast<unsigned int>(
+            firstBlockCount
+        ),
+        TOPK_BLOCK_SIZE
+    >>>(
+        deviceDistances_.data(),
+        deviceTopKBufferA_.data(),
+        vectorCount_,
+        topK
+    );
+
+    CUDA_CHECK(
+        cudaGetLastError()
+    );
+
+    result.topKPasses =
+        1;
+
+    std::size_t currentCount =
+        firstBlockCount *
+        static_cast<std::size_t>(
+            topK
+        );
+
+    Neighbor* currentBuffer =
+        deviceTopKBufferA_.data();
+
+    Neighbor* nextBuffer =
+        deviceTopKBufferB_.data();
+
+    while (currentCount >
+           static_cast<std::size_t>(
+               topK
+           ))
+    {
+        const std::size_t blockCount =
+            ceilDivide(
+                currentCount,
+                static_cast<std::size_t>(
+                    TOPK_BLOCK_SIZE
+                )
+            );
+
+        topKFromCandidatesKernel<<<
+            static_cast<unsigned int>(
+                blockCount
+            ),
+            TOPK_BLOCK_SIZE
+        >>>(
+            currentBuffer,
+            nextBuffer,
+            static_cast<int>(
+                currentCount
+            ),
+            topK
+        );
+
+        CUDA_CHECK(
+            cudaGetLastError()
+        );
+
+        currentCount =
+            blockCount *
+            static_cast<std::size_t>(
+                topK
+            );
+
+        std::swap(
+            currentBuffer,
+            nextBuffer
+        );
+
+        ++result.topKPasses;
+    }
+
+    CUDA_CHECK(
+        cudaEventRecord(
+            topKStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventSynchronize(
+            topKStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventElapsedTime(
+            &result.distanceKernelTimeMs,
+            distanceStart_,
+            distanceStop_
+        )
+    );
+
+    CUDA_CHECK(
+        cudaEventElapsedTime(
+            &result.topKKernelTimeMs,
+            topKStart_,
+            topKStop_
+        )
+    );
+
+    // -----------------------------------------------------
+    // Download only K candidates
+    // -----------------------------------------------------
+
+    const auto downloadStart =
+        std::chrono::steady_clock::now();
+
+    CUDA_CHECK(
+        cudaMemcpy(
+            result.neighbors.data(),
+            currentBuffer,
+            static_cast<std::size_t>(
+                topK
+            ) *
+                sizeof(Neighbor),
+            cudaMemcpyDeviceToHost
+        )
+    );
+
+    const auto downloadEnd =
+        std::chrono::steady_clock::now();
+
+    result.resultDownloadTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            downloadEnd -
+            downloadStart
+        ).count();
+
+    const auto totalEnd =
+        std::chrono::steady_clock::now();
+
+    result.totalTimeMs =
+        std::chrono::duration<
+            double,
+            std::milli
+        >(
+            totalEnd -
+            totalStart
+        ).count();
+
+    return result;
+}
+
+// =========================================================
+// Full-distance warm-up
 // =========================================================
 
 void GpuVectorIndex::warmUp(
@@ -810,16 +1439,7 @@ void GpuVectorIndex::warmUp(
         );
     }
 
-    if (!isSupportedBlockSize(
-            config.blockSize
-        ))
-    {
-        throw std::invalid_argument(
-            "Unsupported CUDA block size."
-        );
-    }
-
-    std::vector<float> warmupQuery(
+    std::vector<float> query(
         static_cast<std::size_t>(
             dimension_
         ),
@@ -831,7 +1451,46 @@ void GpuVectorIndex::warmUp(
          ++iteration)
     {
         (void)search(
-            warmupQuery,
+            query,
+            config
+        );
+    }
+
+    CUDA_CHECK(
+        cudaDeviceSynchronize()
+    );
+}
+
+// =========================================================
+// Top-K warm-up
+// =========================================================
+
+void GpuVectorIndex::warmUpTopK(
+    const GpuSearchConfig& config,
+    const int topK,
+    const int iterations)
+{
+    if (iterations <= 0)
+    {
+        throw std::invalid_argument(
+            "Warm-up iterations must be positive."
+        );
+    }
+
+    std::vector<float> query(
+        static_cast<std::size_t>(
+            dimension_
+        ),
+        0.0F
+    );
+
+    for (int iteration = 0;
+         iteration < iterations;
+         ++iteration)
+    {
+        (void)searchTopK(
+            query,
+            topK,
             config
         );
     }

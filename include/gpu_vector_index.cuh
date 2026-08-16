@@ -85,10 +85,15 @@ struct GpuBatchTopKResult
     // 1/2/4 for the adaptive Milestone 8/M10/M11 paths.
     int queryTileSize = 1;
 
-    // True when the Milestone 10 float4 path was used.
-    // False for M7/M8 and for M10's scalar fallback when
-    // dimension is not divisible by four.
+    // True when a float4 path was used.
+    // False for scalar fallback when dimension is not
+    // divisible by four.
     bool vectorizedLoadsUsed = false;
+
+    // True only for the Milestone 12 instruction-tuned
+    // float4 kernel that uses explicit FP32 FMA accumulation
+    // and shorter temporary live ranges.
+    bool fmaTunedKernelUsed = false;
 
     float fusedKernelTimeMs = 0.0F;
     float mergeKernelTimeMs = 0.0F;
@@ -257,6 +262,22 @@ public:
         int topK
     ) const noexcept;
 
+
+    // -----------------------------------------------------
+    // Milestone 12 instruction-tuned vectorized path
+    //
+    // Reuses the M11 hardware-selected query tile, while
+    // replacing the float4 distance scan with an explicitly
+    // FMA-based accumulator and shorter live ranges.
+    // -----------------------------------------------------
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiledVectorizedFmaAuto(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK
+    );
+
     void warmUp(
         const GpuSearchConfig& config,
         int iterations = 1
@@ -292,6 +313,12 @@ public:
     );
 
     void warmUpTopKBatchTiledVectorizedAuto(
+        int queryCount,
+        int topK,
+        int iterations = 1
+    );
+
+    void warmUpTopKBatchTiledVectorizedFmaAuto(
         int queryCount,
         int topK,
         int iterations = 1
@@ -335,6 +362,15 @@ public:
 
 private:
 
+
+    [[nodiscard]]
+    GpuBatchTopKResult searchTopKBatchTiledVectorizedFmaWithTile(
+        const std::vector<float>& queries,
+        int queryCount,
+        int topK,
+        int queryTileSize
+    );
+
     [[nodiscard]]
     GpuBatchTopKResult searchTopKBatchTiledVectorizedWithTile(
         const std::vector<float>& queries,
@@ -372,8 +408,8 @@ private:
     DeviceBuffer<Neighbor> deviceTopKBufferA_;
     DeviceBuffer<Neighbor> deviceTopKBufferB_;
 
-    // Persistent batch storage shared by the M7, M8, M10
-    // and M11 paths. The methods execute synchronously, so the same
+    // Persistent batch storage shared by the M7, M8, M10,
+    // M11 and M12 paths. The methods execute synchronously, so the same
     // ping-pong buffers can be reused safely.
     DeviceBuffer<float> deviceBatchQueries_;
 

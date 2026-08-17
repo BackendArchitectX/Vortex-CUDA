@@ -58,18 +58,28 @@ Makefile
 .DS_Store
 Thumbs.db
 
-
+# ==============================
 # Generated benchmark artifacts
+# ==============================
 benchmark_results/
 benchmark_results_full/
+benchmark_demo_results/
 
+# ==============================
 # Generated Java build output
+# ==============================
 java/build/
 
-# Maven build output
+# ==============================
+# Maven / release output
+# ==============================
 java/target/
 server/target/
 dist/
+
+# ==============================
+# Local environment files
+# ==============================
 .env
 .env.*
 !.env.example

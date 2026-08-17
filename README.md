@@ -17,14 +17,45 @@ Validated on an **NVIDIA GeForce RTX 3050 6GB Laptop GPU** using exact squared-L
 | Result | Validated workload |
 |---|---|
 | **16.7× lower P50 latency** | GPU exact Top-10 vs the project's scalar CPU reference on `500K × 128` vectors |
+| **~1.67–1.72 ms FP32 P50** | Repeated live-demo single-query exact Top-10 on `500K × 128` |
+| **~1,641–1,662 FP32 QPS** | Repeated live-demo batch-32 exact Top-10 on `500K × 128` |
 | **50% lower vector-index storage** | FP16 storage vs FP32 storage |
-| **99.69% Recall@10** | FP16 storage + FP32 accumulation on `500K × 128` |
+| **99.6875% Recall@10** | FP16 storage + FP32 accumulation at batch 32 on `500K × 128` |
 | **48/48 benchmark cases passed** | Full reproducibility matrix |
 | **99.609375% minimum observed Recall@K** | Across the M15 validation matrix |
 
-> The CPU comparison is against this project's scalar reference implementation, not an optimized production vector database. FP16 is primarily a memory-efficiency tradeoff and is not claimed to provide a universal latency improvement.
+> The CPU comparison is against this project's scalar reference implementation, not an optimized production vector database. The repeated live-demo numbers were captured with the Spring Boot service still running locally, so they demonstrate repeatability rather than isolated capacity-planning performance. FP16 is primarily a memory-efficiency tradeoff and is not claimed to provide a universal latency improvement.
 
-[Benchmark methodology →](docs/BENCHMARKS.md)
+[Benchmark methodology →](docs/BENCHMARKS.md) · [RTX 3050 live benchmark snapshot →](docs/LIVE_BENCHMARK_RTX3050.md)
+
+## Live RTX 3050 benchmark
+
+For `500K × 128`, exact Top-10, five repeated live-demo runs produced:
+
+| Batch | FP32 P50 | FP16 P50 | FP32 QPS | FP16 QPS | Recall@K |
+|---:|---:|---:|---:|---:|---:|
+| 1 | **1.671–1.723 ms** | **0.987–1.012 ms** | 580–599 | 988–1,013 | 100% |
+| 8 | 4.874–4.939 ms | 4.850–4.901 ms | 1,620–1,641 | 1,632–1,649 | 100% |
+| 32 | 19.256–19.503 ms | 19.553–19.804 ms | **1,641–1,662** | 1,616–1,637 | **99.6875%** |
+
+Vector storage for the same workload:
+
+```text
+FP32 vector store: 244.14 MiB
+FP16 vector store: 122.07 MiB
+Reduction:         50.00%
+Recall@1:          100%
+Minimum Recall@K:  99.6875%
+Validation:        PASS
+```
+
+Run the live benchmark locally:
+
+```powershell
+.\DEMO_BENCHMARK.ps1 -Vectors 500000 -Dimension 128 -TopK 10
+```
+
+The wrapper runs the deterministic M15 harness and surfaces the requested workload with P50/P95/P99, QPS, FP32/FP16 comparison, storage reduction and recall validation.
 
 ## Architecture
 
@@ -281,6 +312,7 @@ M18      production hardening + Vortex CUDA 1.0.0
 - [Architecture](docs/ARCHITECTURE.md)
 - [REST API](docs/API.md)
 - [Benchmark methodology](docs/BENCHMARKS.md)
+- [RTX 3050 live benchmark snapshot](docs/LIVE_BENCHMARK_RTX3050.md)
 - [Binary ingestion format](docs/BINARY_FORMAT.md)
 - [Security and deployment](docs/SECURITY.md)
 - [Changelog](CHANGELOG.md)

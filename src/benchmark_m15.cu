@@ -655,6 +655,30 @@ double recallAtDepth(
                     )
                 ].index;
 
+            bool duplicate = false;
+
+            for (int previousRank = 0;
+                 previousRank < actualRank;
+                 ++previousRank)
+            {
+                if (actual[
+                        base +
+                        static_cast<std::size_t>(
+                            previousRank
+                        )
+                    ].index ==
+                    actualIndex)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (duplicate)
+            {
+                continue;
+            }
+
             bool found = false;
 
             for (int expectedRank = 0;

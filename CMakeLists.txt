@@ -6,6 +6,8 @@ project(
         LANGUAGES CXX CUDA
 )
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -69,6 +71,31 @@ add_executable(
         src/benchmark_m15.cu
         src/gpu_vector_index.cu
 )
+
+if (BUILD_TESTING)
+    add_executable(
+            vortex_benchmark_recall_test
+            tests/benchmark_m15_recall_test.cu
+            src/gpu_vector_index.cu
+    )
+
+    target_include_directories(
+            vortex_benchmark_recall_test
+            PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    set_target_properties(
+            vortex_benchmark_recall_test
+            PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+    )
+
+    add_test(
+            NAME benchmark_m15_recall
+            COMMAND vortex_benchmark_recall_test
+    )
+endif()
 
 foreach(VORTEX_TARGET IN ITEMS vortex_cuda vortex_benchmark)
     target_include_directories(
